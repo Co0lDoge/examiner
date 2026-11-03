@@ -120,6 +120,7 @@ func (h *Handler) handleTeacherMe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleTeacherUpload processes question file uploads and test definitions submitted by teachers.
 func (h *Handler) handleTeacherUpload(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(10 << 20); err != nil {
 		http.Error(w, "file too large", http.StatusBadRequest)
