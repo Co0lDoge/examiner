@@ -233,5 +233,22 @@
   {"id": "BackupColFile", "other": "File"},
   {"id": "BackupColTime", "other": "Created (UTC)"},
   {"id": "BackupColSize", "other": "Size"},
-  {"id": "BackupWithConfig", "other": "configuration"}
+  {"id": "BackupWithConfig", "other": "configuration"},
+  {"id": "FilterStatus", "other": "Status"},
+  {"id": "StatusAll", "other": "All"},
+  {"id": "StatusGraded", "other": "Awaiting review"},
+  {"id": "StatusReviewed", "other": "Reviewed"},
+  {"id": "FilterDateFrom", "other": "From date"},
+  {"id": "FilterDateTo", "other": "To date"},
+  {"id": "FilterToday", "other": "Today"},
+  {"id": "FilterAllDates", "other": "All dates"},
+  {"id": "FilterApply", "other": "Apply"},
+  {"id": "ColLLMGrade", "other": "LLM grade"},
+  {"id": "ColFinalGrade", "other": "Final grade"},
+  {"id": "ReviewInvalidDate", "other": "Invalid date format. Please use YYYY-MM-DD."},
+  {"id": "ReviewInvalidDateRange", "other": "The start date must not be after the end date."},
+  {"id": "ReviewInvalidStatus", "other": "Invalid status filter."},
+  {"id": "PaginationPrev", "other": "‹ Previous"},
+  {"id": "PaginationNext", "other": "Next ›"},
+  {"id": "PaginationInfo", "other": "Page {{.Page}} of {{.TotalPages}} ({{.Total}} total)"}
 ]

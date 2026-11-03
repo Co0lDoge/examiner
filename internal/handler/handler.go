@@ -42,6 +42,9 @@ type Handler struct {
 	// backupMu serializes backups from the admin page: two in the same
 	// second would get the same file name.
 	backupMu sync.Mutex
+
+	// nowFunc overrides time.Now in tests (nil uses time.Now).
+	nowFunc func() time.Time
 }
 
 // New creates a new Handler. The error is kept for callers; nothing in
@@ -235,48 +238,30 @@ func (h *Handler) handleStudentResults(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleReviewList(w http.ResponseWriter, r *http.Request) {
-	sessions, err := h.store.ListSessions()
-	if err != nil {
-		slog.Error("failed to list sessions for review", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	topics, err := h.store.ListPublishedTopics()
-	if err != nil {
-		slog.Error("failed to list statement topics", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	// Keep historical exam topics selectable after their questions are unpublished.
-	topicSet := make(map[string]struct{}, len(topics))
-	for _, topic := range topics {
-		topicSet[topic] = struct{}{}
-	}
-	for _, session := range sessions {
-		if session.SubmittedAt != nil && session.TopicKnown {
-			topicSet[session.Topic] = struct{}{}
+	filter, view := parseReviewFilter(r.URL.Query(), h.reviewLocation(), h.now())
+	if view.ErrorKey == "" {
+		rows, total, err := h.store.ListSessionsForReview(filter)
+		if err != nil {
+			slog.Error("failed to list sessions for review", "error", err)
+			http.Error(w, "failed to list sessions", http.StatusInternalServerError)
+			return
 		}
-	}
-	topics = topics[:0]
-	for topic := range topicSet {
-		if topic != "" {
-			topics = append(topics, topic)
+		view.Rows = rows
+		view.Total = total
+		view.TotalPages = (total + reviewPageSize - 1) / reviewPageSize
+		if view.TotalPages < 1 {
+			view.TotalPages = 1
 		}
-	}
-	sort.Strings(topics)
-
-	var reviewable, other []model.ExamSession
-	for _, s := range sessions {
-		if s.Status == model.StatusGraded || s.Status == model.StatusReviewed || s.Status == model.StatusGradingFailed {
-			reviewable = append(reviewable, s)
-		} else {
-			other = append(other, s)
+		if view.Page > 1 {
+			view.PrevURL = buildReviewPageURL(view.Status, view.From, view.To, view.Page-1)
+		}
+		if view.Page < view.TotalPages {
+			view.NextURL = buildReviewPageURL(view.Status, view.From, view.To, view.Page+1)
 		}
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := views.ReviewListPage(reviewable, other, topics, r.URL.Query()).Render(r.Context(), w); err != nil {
+	if err := views.ReviewListPage(view).Render(r.Context(), w); err != nil {
 		slog.Error("render error", "error", err)
 	}
 }
