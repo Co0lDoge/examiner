@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/pavelanni/examiner/internal/handler/views"
+	appI18n "github.com/pavelanni/examiner/internal/i18n"
 	"github.com/pavelanni/examiner/internal/model"
 )
 
@@ -130,7 +130,7 @@ func (h *Handler) handleUploadQuestions(w http.ResponseWriter, r *http.Request) 
 	}
 	if storedHash == hash {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := views.AdminQuestionsPage("UploadDuplicate", true).Render(r.Context(), w); err != nil {
+		if err := views.AdminQuestionsPage(appI18n.T(r.Context(), "UploadDuplicate"), true).Render(r.Context(), w); err != nil {
 			slog.Error("render error", "error", err)
 		}
 		return
@@ -153,7 +153,11 @@ func (h *Handler) handleUploadQuestions(w http.ResponseWriter, r *http.Request) 
 
 		// Check duplicate within the same file (intra-file)
 		if prevNum, duplicate := seenInFile[key]; duplicate {
-			warnings = append(warnings, fmt.Sprintf("Вопрос №%d совпадает с вопросом №%d в файле в теме %q (пропущен).", qNum, prevNum, qi.Topic))
+			warnings = append(warnings, appI18n.Td(r.Context(), "UploadDuplicateInFile", map[string]any{
+				"Num":     qNum,
+				"PrevNum": prevNum,
+				"Topic":   qi.Topic,
+			}))
 			continue
 		}
 		seenInFile[key] = qNum
@@ -166,7 +170,11 @@ func (h *Handler) handleUploadQuestions(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		if existing != nil {
-			warnings = append(warnings, fmt.Sprintf("Вопрос №%d совпадает с существующим вопросом #%d в теме %q (пропущен).", qNum, existing.ID, qi.Topic))
+			warnings = append(warnings, appI18n.Td(r.Context(), "UploadDuplicateInDB", map[string]any{
+				"Num":   qNum,
+				"ID":    existing.ID,
+				"Topic": qi.Topic,
+			}))
 			continue
 		}
 
@@ -198,9 +206,14 @@ func (h *Handler) handleUploadQuestions(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	var msg string
 	if len(warnings) > 0 {
-		msg = fmt.Sprintf("Успешно импортировано %d вопросов. Предупреждения: %s", importedCount, strings.Join(warnings, " "))
+		msg = appI18n.Td(r.Context(), "UploadSuccessWithWarnings", map[string]any{
+			"Count":    importedCount,
+			"Warnings": strings.Join(warnings, " "),
+		})
 	} else {
-		msg = fmt.Sprintf("Successfully imported %d questions.", importedCount)
+		msg = appI18n.Td(r.Context(), "UploadSuccess", map[string]any{
+			"Count": importedCount,
+		})
 	}
 	if err := views.AdminQuestionsPage(msg, len(warnings) > 0).Render(r.Context(), w); err != nil {
 		slog.Error("render error", "error", err)
