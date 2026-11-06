@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -84,6 +85,24 @@ func (s *Store) ListUsers() ([]model.User, error) {
 func (s *Store) ToggleUserActive(id int64) error {
 	_, err := s.db.Exec(`UPDATE users SET active = NOT active WHERE id = ?`, id)
 	return err
+}
+
+// ReactivateAdmin включает существующего администратора, сохраняя пароль,
+// роль и данные экзаменов. Создание пользователей и повышение роли исключены.
+func (s *Store) ReactivateAdmin(username string) error {
+	result, err := s.db.Exec(`UPDATE users SET active = 1 WHERE username = ? AND role = ?`,
+		username, model.UserRoleAdmin)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return fmt.Errorf("administrator %q not found", username)
+	}
+	return nil
 }
 
 // UserCount returns the total number of users.

@@ -156,6 +156,20 @@ users exist in the database yet. The admin user is only created once
 (when the `users` table is empty). On subsequent runs the password
 setting is ignored.
 
+### Recovering a deactivated administrator
+
+If the only administrator was accidentally deactivated in an older version,
+stop the server, back up its database (including any SQLite WAL files), and run:
+
+```bash
+./bin/examiner reactivate-admin --db examiner.db --username admin
+```
+
+This local recovery command reactivates an existing administrator without
+changing their password or creating users. It requires an existing database file
+and uses the explicit `--db` path, independently of environment/config-file settings.
+See the [Windows recovery walkthrough](docs/development/admin-access-recovery-ru.md).
+
 ### Adding users
 
 Only admins can create users. Log in as `admin`, then navigate to
