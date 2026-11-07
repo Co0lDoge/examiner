@@ -34,6 +34,7 @@ type Handler struct {
 	llm            Evaluator
 	config         model.ExamConfig
 	questionSchema *jsonschema.Schema
+	registration   registrationAdmission
 
 	// inFlight is the set of thread IDs with an answer being processed, so
 	// only one answer per thread runs at a time. Entries are removed when the
@@ -106,6 +107,14 @@ func (h *Handler) Routes(r chi.Router) {
 		r.Get("/login", h.handleLoginPage)
 		r.Post("/login", h.handleLogin)
 	})
+
+	if h.config.AllowRegistration {
+		r.Group(func(r chi.Router) {
+			r.Use(registrationFormLimit, h.csrfMiddleware)
+			r.Get("/register", h.handleRegisterPage)
+			r.Post("/register", h.handleRegister)
+		})
+	}
 
 	// Authenticated routes.
 	r.Group(func(r chi.Router) {
