@@ -70,6 +70,9 @@ or a config file. Precedence: **flags > env vars > config file > defaults**.
 | `--llm-url` | | `http://localhost:11434/v1` | OpenAI-compatible API base URL |
 | `--llm-key` | | `ollama` | API key for the LLM |
 | `--llm-model` | | `llama3.2` | Model name |
+| `--llm-timeout` | | `90s` | Timeout per LLM attempt, including queue wait |
+| `--llm-max-retries` | | `3` | Retries after the initial attempt (`0` disables retries; maximum `100`) |
+| `--llm-max-concurrency` | | `4` | Maximum simultaneous LLM requests per process |
 | `--lang` | `-l` | `en` | UI language (`en`, `ru`) |
 | `--num-questions` | `-n` | `0` (all) | Number of questions per exam |
 | `--difficulty` | `-d` | (all) | Filter by difficulty; comma-separated for multiple levels (e.g. `easy,medium`) |
@@ -92,6 +95,9 @@ prefix. Hyphens become underscores:
 export EXAMINER_LLM_URL=https://api.openai.com/v1
 export EXAMINER_LLM_KEY=sk-...
 export EXAMINER_LLM_MODEL=gpt-4o
+export EXAMINER_LLM_TIMEOUT=90s
+export EXAMINER_LLM_MAX_RETRIES=3
+export EXAMINER_LLM_MAX_CONCURRENCY=4
 export EXAMINER_LANG=ru
 export EXAMINER_NUM_QUESTIONS=10
 export EXAMINER_SHUFFLE=true
@@ -115,6 +121,9 @@ questions: questions/physics_ru.json
 lang: ru
 llm-url: https://api.openai.com/v1
 llm-model: gpt-4o
+llm-timeout: 90s
+llm-max-retries: 3
+llm-max-concurrency: 4
 num-questions: 10
 difficulty: easy,medium
 shuffle: true
@@ -133,6 +142,21 @@ secure-cookies: true
 # Only "Mechanics" topic, 5 questions
 ./examiner -t "Законы Ньютона" -n 5 --shuffle
 ```
+
+### LLM timeouts and retries
+
+LLM calls retry timeouts, network errors, HTTP 429 and 5xx, malformed JSON,
+and empty choices with exponential backoff and jitter. HTTP 400 and 401 are
+not retried. `Retry-After` is respected while the overall call budget allows;
+waiting and retries stop when the calling context is cancelled. Interactive
+feedback inherits the browser request's context.
+
+The concurrency limit is shared by feedback and final grading. When the limit
+is greater than one, final grading uses at most `limit - 1` slots, reserving
+one for feedback. Limits apply to one process, and the default of four is a
+conservative starting point pending load tests with the selected LLM.
+See [LLM reliability](docs/development/llm-reliability.md) for timing budgets,
+configuration, and the boundary with background grading.
 
 ## Authentication and user management
 
