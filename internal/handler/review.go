@@ -13,7 +13,41 @@ import (
 
 const reviewPageSize = 50
 
+const maxReviewPage = 1000000
+
 const dateLayout = "2006-01-02"
+
+func parseDateParts(s string) (year int, month time.Month, day int, err error) {
+	t, err := time.Parse(dateLayout, s)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	y, m, d := t.Date()
+	return y, m, d, nil
+}
+
+// firstInstantOfDay returns the first instant of the given calendar day in loc,
+// accounting for time zones that skip midnight (e.g. DST transitions).
+func firstInstantOfDay(y int, m time.Month, d int, loc *time.Location) time.Time {
+	if loc == nil {
+		loc = time.UTC
+	}
+	t := time.Date(y, m, d, 0, 0, 0, 0, loc)
+	if t.Year() != y || t.Month() != m || t.Day() != d {
+		// Midnight was skipped in this location due to DST gap.
+		_, end := t.ZoneBounds()
+		if !end.IsZero() && end.In(loc).Year() == y && end.In(loc).Month() == m && end.In(loc).Day() == d {
+			return end.In(loc)
+		}
+		for hr := 1; hr <= 4; hr++ {
+			cand := time.Date(y, m, d, hr, 0, 0, 0, loc)
+			if cand.Year() == y && cand.Month() == m && cand.Day() == d {
+				return cand
+			}
+		}
+	}
+	return t
+}
 
 func (h *Handler) reviewLocation() *time.Location {
 	if h.config.Location != nil {
@@ -86,29 +120,31 @@ func parseReviewFilter(q url.Values, loc *time.Location, now time.Time) (store.R
 	var fromOK, toOK bool
 
 	if fromStr != "" {
-		d, err := time.ParseInLocation(dateLayout, fromStr, loc)
+		y, m, d, err := parseDateParts(fromStr)
 		if err != nil {
 			if view.ErrorKey == "" {
 				view.ErrorKey = "ReviewInvalidDate"
 			}
 		} else {
-			fromDay = d
+			fromDay = firstInstantOfDay(y, m, d, loc)
 			fromOK = true
-			filter.From = d
+			filter.From = fromDay
 		}
 	}
 
 	if toStr != "" {
-		d, err := time.ParseInLocation(dateLayout, toStr, loc)
+		y, m, d, err := parseDateParts(toStr)
 		if err != nil {
 			if view.ErrorKey == "" {
 				view.ErrorKey = "ReviewInvalidDate"
 			}
 		} else {
-			toDay = d
+			toDay = firstInstantOfDay(y, m, d, loc)
 			toOK = true
-			// Inclusive end date: [From 00:00, (To + 1 day) 00:00) in loc.
-			filter.To = d.AddDate(0, 0, 1)
+			// Inclusive end date: [From, NextDayStart) in loc.
+			nextDate := time.Date(y, m, d+1, 12, 0, 0, 0, time.UTC)
+			ny, nm, nd := nextDate.Date()
+			filter.To = firstInstantOfDay(ny, nm, nd, loc)
 		}
 	}
 
@@ -120,7 +156,7 @@ func parseReviewFilter(q url.Values, loc *time.Location, now time.Time) (store.R
 
 	page := 1
 	if pStr := strings.TrimSpace(q.Get("page")); pStr != "" {
-		if p, err := strconv.Atoi(pStr); err == nil && p > 1 {
+		if p, err := strconv.Atoi(pStr); err == nil && p > 1 && p <= maxReviewPage {
 			page = p
 		}
 	}

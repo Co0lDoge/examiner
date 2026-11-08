@@ -624,6 +624,17 @@ func (h *Handler) handleReviewList(w http.ResponseWriter, r *http.Request) {
 		if view.TotalPages < 1 {
 			view.TotalPages = 1
 		}
+		if total > 0 && view.Page > view.TotalPages {
+			view.Page = view.TotalPages
+			filter.Offset = (view.Page - 1) * reviewPageSize
+			rows, _, err = h.store.ListSessionsForReview(filter)
+			if err != nil {
+				slog.Error("failed to list sessions for review", "error", err)
+				http.Error(w, "failed to list sessions", http.StatusInternalServerError)
+				return
+			}
+			view.Rows = rows
+		}
 		if view.Page > 1 {
 			view.PrevURL = buildReviewPageURL(view.Status, view.From, view.To, view.Page-1)
 		}

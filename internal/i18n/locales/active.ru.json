@@ -128,5 +128,6 @@
   {"id": "ReviewInvalidStatus", "other": "Некорректный фильтр статуса."},
   {"id": "PaginationPrev", "other": "‹ Назад"},
   {"id": "PaginationNext", "other": "Вперёд ›"},
-  {"id": "PaginationInfo", "other": "Страница {{.Page}} из {{.TotalPages}} (всего: {{.Total}})"}
+  {"id": "PaginationInfo", "other": "Страница {{.Page}} из {{.TotalPages}} (всего: {{.Total}})"},
+  {"id": "PaginationNavLabel", "other": "Страницы"}
 ]

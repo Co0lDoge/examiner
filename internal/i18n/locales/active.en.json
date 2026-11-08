@@ -128,5 +128,6 @@
   {"id": "ReviewInvalidStatus", "other": "Invalid status filter."},
   {"id": "PaginationPrev", "other": "‹ Previous"},
   {"id": "PaginationNext", "other": "Next ›"},
-  {"id": "PaginationInfo", "other": "Page {{.Page}} of {{.TotalPages}} ({{.Total}} total)"}
+  {"id": "PaginationInfo", "other": "Page {{.Page}} of {{.TotalPages}} ({{.Total}} total)"},
+  {"id": "PaginationNavLabel", "other": "Pagination"}
 ]

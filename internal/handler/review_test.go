@@ -129,6 +129,30 @@ func TestParseReviewFilter(t *testing.T) {
 		if v.Page != 1 || f.Offset != 0 {
 			t.Errorf("negative page: page=%d offset=%d", v.Page, f.Offset)
 		}
+
+		f, v = parseReviewFilter(url.Values{"page": {"1000001"}}, msk, now)
+		if v.Page != 1 || f.Offset != 0 {
+			t.Errorf("overflow page: page=%d offset=%d", v.Page, f.Offset)
+		}
+	})
+
+	t.Run("America/Santiago skipped midnight on 2024-09-08", func(t *testing.T) {
+		santiago := mustLocation(t, "America/Santiago")
+		f, v := parseReviewFilter(url.Values{"date": {"2024-09-08"}}, santiago, now)
+		if v.ErrorKey != "" {
+			t.Fatalf("unexpected ErrorKey: %q", v.ErrorKey)
+		}
+		// In America/Santiago, midnight on 2024-09-08 was skipped; clocks jumped from 23:59:59 to 01:00:00.
+		// The first instant of 2024-09-08 is 01:00:00 -0300 (04:00:00 UTC).
+		// The first instant of 2024-09-09 is 00:00:00 -0300 (03:00:00 UTC).
+		wantFrom := time.Date(2024, 9, 8, 1, 0, 0, 0, santiago)
+		wantTo := time.Date(2024, 9, 9, 0, 0, 0, 0, santiago)
+		if !f.From.Equal(wantFrom) {
+			t.Errorf("From = %v (UTC %v), want %v (UTC %v)", f.From, f.From.UTC(), wantFrom, wantFrom.UTC())
+		}
+		if !f.To.Equal(wantTo) {
+			t.Errorf("To = %v (UTC %v), want %v (UTC %v)", f.To, f.To.UTC(), wantTo, wantTo.UTC())
+		}
 	})
 }
 
@@ -331,6 +355,9 @@ func TestHandleReviewListPagination(t *testing.T) {
 	if !strings.Contains(body1, "Page 1 of 2 (55 total)") {
 		t.Errorf("expected pagination summary on page 1, got:\n%s", body1)
 	}
+	if !strings.Contains(body1, `aria-label="Pagination"`) {
+		t.Errorf("expected translated pagination aria-label in English, got:\n%s", body1)
+	}
 	if !strings.Contains(body1, `/review?page=2&amp;status=graded`) && !strings.Contains(body1, `/review?status=graded&amp;page=2`) {
 		t.Errorf("expected next page link preserving status=graded, got:\n%s", body1)
 	}
@@ -345,5 +372,31 @@ func TestHandleReviewListPagination(t *testing.T) {
 	}
 	if strings.Count(body2, `href="/review/`) < 5 {
 		t.Errorf("expected 5 session links on page 2")
+	}
+
+	// Clamping out-of-range page to TotalPages and showing rows:
+	recClamped := env.get("/review?status=graded&page=999")
+	if recClamped.Code != http.StatusOK {
+		t.Fatalf("page 999 status = %d", recClamped.Code)
+	}
+	bodyClamped := recClamped.Body.String()
+	if !strings.Contains(bodyClamped, "Page 2 of 2 (55 total)") {
+		t.Errorf("expected clamped page 2, got:\n%s", bodyClamped)
+	}
+	if strings.Count(bodyClamped, `href="/review/`) < 5 {
+		t.Errorf("expected rows rendered on clamped page")
+	}
+
+	// Pagination nav label in Russian
+	envRu := newReviewTestEnv(t, "ru", "/ru")
+	for i := range 55 {
+		envRu.addSession(1, model.StatusGraded, base.Add(time.Duration(i)*time.Minute), 50, nil)
+	}
+	recRu := envRu.get("/ru/review?status=graded")
+	if recRu.Code != http.StatusOK {
+		t.Fatalf("page 1 status in ru = %d", recRu.Code)
+	}
+	if !strings.Contains(recRu.Body.String(), `aria-label="Страницы"`) {
+		t.Errorf("expected translated pagination aria-label in Russian, got:\n%s", recRu.Body.String())
 	}
 }
