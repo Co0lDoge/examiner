@@ -25,18 +25,8 @@ func TestTeacherUploadRedirectRespectsBasePath(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	// Save original directory (internal/handler).
-	pkgDir, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("os.Getwd: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(pkgDir) })
-
 	// Change to repository root so compileQuestionSchema() finds schema/question_schema.json.
-	rootDir := filepath.Clean(filepath.Join(pkgDir, "..", ".."))
-	if err := os.Chdir(rootDir); err != nil {
-		t.Fatalf("os.Chdir root: %v", err)
-	}
+	t.Chdir(filepath.Join("..", ".."))
 
 	basePath := "/ru"
 	cfg := model.ExamConfig{
@@ -50,9 +40,7 @@ func TestTeacherUploadRedirectRespectsBasePath(t *testing.T) {
 
 	// Change to a temporary directory so the uploaded question file is isolated.
 	tmpDir := t.TempDir()
-	if err := os.Chdir(tmpDir); err != nil {
-		t.Fatalf("os.Chdir tmpDir: %v", err)
-	}
+	t.Chdir(tmpDir)
 	if err := os.MkdirAll(filepath.Join(tmpDir, "questions"), 0755); err != nil {
 		t.Fatalf("os.MkdirAll questions: %v", err)
 	}
