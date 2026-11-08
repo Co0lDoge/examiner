@@ -124,7 +124,7 @@ templ ReviewListPage(view ReviewListView) {
 				</tbody>
 			</table>
 			if view.TotalPages > 1 {
-				<nav aria-label="pagination">
+				<nav aria-label={ t(ctx, "PaginationNavLabel") }>
 					<ul>
 						<li>
 							if view.PrevURL != "" {
