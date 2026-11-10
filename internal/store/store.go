@@ -686,28 +686,30 @@ func (s *Store) GetSessionView(sessionID int64) (*model.SessionView, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Only GetSession can report a missing URL record. Child errors
+	// intentionally use %v so lookupError logs them and returns 500.
 	bp, err := s.GetBlueprint(sess.BlueprintID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load session blueprint: %v", err)
 	}
 	threads, err := s.GetThreadsForSession(sessionID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load session threads: %v", err)
 	}
 
 	var threadViews []model.ThreadView
 	for _, t := range threads {
 		q, err := s.GetQuestion(t.QuestionID)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("load session question: %v", err)
 		}
 		msgs, err := s.GetMessages(t.ID)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("load session messages: %v", err)
 		}
 		score, err := s.GetScore(t.ID)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("load session score: %v", err)
 		}
 		threadViews = append(threadViews, model.ThreadView{
 			Thread:   t,
@@ -719,7 +721,7 @@ func (s *Store) GetSessionView(sessionID int64) (*model.SessionView, error) {
 
 	grade, err := s.GetGrade(sessionID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load session grade: %v", err)
 	}
 
 	return &model.SessionView{

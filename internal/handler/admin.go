@@ -4,18 +4,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"strconv"
 
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/pavelanni/examiner/internal/handler/views"
 	appI18n "github.com/pavelanni/examiner/internal/i18n"
 	"github.com/pavelanni/examiner/internal/model"
+	"github.com/pavelanni/examiner/internal/store"
 )
 
 // handleAdminUsersPage serves the admin users management page.
@@ -23,7 +23,7 @@ func (h *Handler) handleAdminUsersPage(w http.ResponseWriter, r *http.Request) {
 	users, err := h.store.ListUsers()
 	if err != nil {
 		slog.Error("failed to list users", "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -64,9 +64,13 @@ func (h *Handler) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		Role:         model.UserRole(role),
 		Active:       true,
 	})
+	if errors.Is(err, store.ErrUsernameTaken) {
+		http.Error(w, "username already exists", http.StatusConflict)
+		return
+	}
 	if err != nil {
 		slog.Error("failed to create user", "error", err)
-		http.Error(w, "failed to create user: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "failed to create user", http.StatusInternalServerError)
 		return
 	}
 
@@ -76,10 +80,8 @@ func (h *Handler) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 // handleToggleUserActive переключает активность другого пользователя.
 // Собственную учётную запись администратора отключить нельзя.
 func (h *Handler) handleToggleUserActive(w http.ResponseWriter, r *http.Request) {
-	idStr := chi.URLParam(r, "userID")
-	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		http.Error(w, "invalid user ID", http.StatusBadRequest)
+	id, ok := parseIDParam(w, r, "userID")
+	if !ok {
 		return
 	}
 
@@ -89,8 +91,7 @@ func (h *Handler) handleToggleUserActive(w http.ResponseWriter, r *http.Request)
 	}
 
 	if err := h.store.ToggleUserActive(id); err != nil {
-		slog.Error("failed to toggle user active", "id", id, "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		lookupError(w, err, "failed to toggle user active", "user_id", id)
 		return
 	}
 
@@ -160,7 +161,7 @@ func (h *Handler) handleUploadQuestions(w http.ResponseWriter, r *http.Request) 
 		})
 		if err != nil {
 			slog.Error("failed to insert question", "error", err)
-			http.Error(w, "failed to insert question: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "failed to insert question", http.StatusInternalServerError)
 			return
 		}
 	}
