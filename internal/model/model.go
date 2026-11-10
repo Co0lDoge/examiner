@@ -128,6 +128,14 @@ type Question struct {
 	MaxPoints   int        `json:"max_points"`
 }
 
+// DuplicateQuestionGroup represents existing questions in the database that share
+// the same topic and normalized text.
+type DuplicateQuestionGroup struct {
+	Topic     string     `json:"topic"`
+	TextNorm  string     `json:"text_norm"`
+	Questions []Question `json:"questions"`
+}
+
 // ExamBlueprint defines the structure of an exam.
 type ExamBlueprint struct {
 	ID           int64  `json:"id"`

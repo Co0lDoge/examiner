@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -91,10 +92,35 @@ func (h *Handler) handleToggleUserActive(w http.ResponseWriter, r *http.Request)
 	http.Redirect(w, r, h.path("/admin/users"), http.StatusSeeOther)
 }
 
+func questionDupKey(topic, textNorm string) string {
+	return topic + "\x00" + textNorm
+}
+
+func formatUploadSummary(ctx context.Context, count int, warnings []string) string {
+	if len(warnings) > 0 {
+		return appI18n.Td(ctx, "UploadSuccessWithWarnings", map[string]any{
+			"Count":    count,
+			"Warnings": strings.Join(warnings, " "),
+		})
+	}
+	return appI18n.Td(ctx, "UploadSuccess", map[string]any{
+		"Count": count,
+	})
+}
+
+func (h *Handler) loadExistingDuplicates() []model.DuplicateQuestionGroup {
+	dups, err := h.store.FindExistingDuplicates()
+	if err != nil {
+		slog.Error("failed to find existing duplicate questions", "error", err)
+		return nil
+	}
+	return dups
+}
+
 // handleAdminQuestionsPage serves the admin questions management page.
 func (h *Handler) handleAdminQuestionsPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := views.AdminQuestionsPage("", false).Render(r.Context(), w); err != nil {
+	if err := views.AdminQuestionsPage("", false, h.loadExistingDuplicates()).Render(r.Context(), w); err != nil {
 		slog.Error("render error", "error", err)
 	}
 }
@@ -130,7 +156,7 @@ func (h *Handler) handleUploadQuestions(w http.ResponseWriter, r *http.Request) 
 	}
 	if storedHash == hash {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := views.AdminQuestionsPage(appI18n.T(r.Context(), "UploadDuplicate"), true).Render(r.Context(), w); err != nil {
+		if err := views.AdminQuestionsPage(appI18n.T(r.Context(), "UploadDuplicate"), true, h.loadExistingDuplicates()).Render(r.Context(), w); err != nil {
 			slog.Error("render error", "error", err)
 		}
 		return
@@ -149,7 +175,7 @@ func (h *Handler) handleUploadQuestions(w http.ResponseWriter, r *http.Request) 
 	for i, qi := range questions {
 		qNum := i + 1
 		norm := model.NormalizeQuestionText(qi.Text)
-		key := qi.Topic + "\x00" + norm
+		key := questionDupKey(qi.Topic, norm)
 
 		// Check duplicate within the same file (intra-file)
 		if prevNum, duplicate := seenInFile[key]; duplicate {
@@ -189,12 +215,15 @@ func (h *Handler) handleUploadQuestions(w http.ResponseWriter, r *http.Request) 
 			ModelAnswer: qi.ModelAnswer,
 			MaxPoints:   qi.MaxPoints,
 		}
-		if _, err := h.store.InsertQuestion(q); err != nil {
+		id, err := h.store.InsertQuestion(q)
+		if err != nil {
 			slog.Error("failed to insert question", "error", err)
-			http.Error(w, "failed to insert question: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		importedCount++
+		if id > 0 {
+			importedCount++
+		}
 	}
 
 	if err := h.store.SetImportedFileHash(header.Filename, hash); err != nil {
@@ -204,18 +233,8 @@ func (h *Handler) handleUploadQuestions(w http.ResponseWriter, r *http.Request) 
 	slog.Info("uploaded questions via admin", "filename", header.Filename, "imported", importedCount, "warnings", len(warnings))
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	var msg string
-	if len(warnings) > 0 {
-		msg = appI18n.Td(r.Context(), "UploadSuccessWithWarnings", map[string]any{
-			"Count":    importedCount,
-			"Warnings": strings.Join(warnings, " "),
-		})
-	} else {
-		msg = appI18n.Td(r.Context(), "UploadSuccess", map[string]any{
-			"Count": importedCount,
-		})
-	}
-	if err := views.AdminQuestionsPage(msg, len(warnings) > 0).Render(r.Context(), w); err != nil {
+	msg := formatUploadSummary(r.Context(), importedCount, warnings)
+	if err := views.AdminQuestionsPage(msg, len(warnings) > 0, h.loadExistingDuplicates()).Render(r.Context(), w); err != nil {
 		slog.Error("render error", "error", err)
 	}
 }

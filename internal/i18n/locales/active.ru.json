@@ -102,6 +102,8 @@
   {"id": "UploadDuplicate", "other": "Этот файл уже был импортирован."},
   {"id": "UploadDuplicateInFile", "other": "Вопрос №{{.Num}} совпадает с вопросом №{{.PrevNum}} в файле в теме \"{{.Topic}}\" (пропущен)."},
   {"id": "UploadDuplicateInDB", "other": "Вопрос №{{.Num}} совпадает с существующим вопросом #{{.ID}} в теме \"{{.Topic}}\" (пропущен)."},
+  {"id": "ExistingDuplicatesTitle", "other": "Существующие дубликаты вопросов в базе данных ({{.Count}})"},
+  {"id": "ExistingDuplicatesDesc", "other": "Следующие группы имеют одинаковую тему и нормализованный текст (сохранены для целостности истории сессий):"},
   {"id": "AccessDenied", "other": "Доступ запрещён"},
   {"id": "Forbidden", "other": "У вас нет прав для доступа к этой странице."},
   {"id": "ResultsTitle", "other": "Результаты — Сессия {{.ID}}"},

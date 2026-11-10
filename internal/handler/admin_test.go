@@ -2,7 +2,6 @@ package handler
 
 import (
 	"bytes"
-	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -140,5 +139,43 @@ func TestAdminUploadDuplicateProtection(t *testing.T) {
 		t.Errorf("expected Russian warning about existing question in DB, got: %s", bodyRuNew)
 	}
 
-	fmt.Println("All duplicate protection criteria passed!")
+	// Проверяем отображение отчёта о существующих в БД дубликатах (не удаляя их).
+	if _, err := s.InsertQuestion(model.Question{
+		CourseID: 1, Text: "что такое пид-регулятор", Difficulty: model.DifficultyEasy, Topic: "control", MaxPoints: 10,
+	}); err != nil {
+		t.Fatalf("InsertQuestion legacy near-duplicate: %v", err)
+	}
+	reqPage := httptest.NewRequest(http.MethodGet, "/admin/questions", nil)
+	reqPage = reqPage.WithContext(i18n.WithLocalizer(model.ContextWithUser(reqPage.Context(), &model.User{ID: 1, Role: model.UserRoleAdmin}), i18n.NewLocalizer("en")))
+	recPage := httptest.NewRecorder()
+	h.handleAdminQuestionsPage(recPage, reqPage)
+	if recPage.Code != http.StatusOK {
+		t.Fatalf("GET /admin/questions status = %d", recPage.Code)
+	}
+	if !strings.Contains(recPage.Body.String(), "Existing duplicate questions in database (1)") {
+		t.Errorf("expected existing duplicates report on admin page, got: %s", recPage.Body.String())
+	}
+	countAfterReport, err := s.QuestionCount()
+	if err != nil {
+		t.Fatalf("QuestionCount after report: %v", err)
+	}
+	if countAfterReport != 2 {
+		t.Errorf("expected both legacy near-duplicates to remain (2), got %d", countAfterReport)
+	}
+
+	// Вопрос с тем же текстом в ДРУГОЙ теме должен импортироваться отдельно (не падать в silent ignore).
+	recCrossTopic := uploadQuestions("questions_other_topic.json", `[{"text": "Что такое ПИД-регулятор?", "difficulty": "easy", "topic": "automation", "rubric": "r", "model_answer": "a", "max_points": 10}]`)
+	if recCrossTopic.Code != http.StatusOK {
+		t.Fatalf("cross-topic upload status = %d, body: %s", recCrossTopic.Code, recCrossTopic.Body.String())
+	}
+	if !strings.Contains(recCrossTopic.Body.String(), "Successfully imported 1 questions.") {
+		t.Errorf("expected 1 imported question for new topic, got: %s", recCrossTopic.Body.String())
+	}
+	countAfterCrossTopic, err := s.QuestionCount()
+	if err != nil {
+		t.Fatalf("QuestionCount after cross-topic: %v", err)
+	}
+	if countAfterCrossTopic != 3 {
+		t.Errorf("expected 3 questions in DB after cross-topic import, got %d", countAfterCrossTopic)
+	}
 }

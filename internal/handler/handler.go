@@ -220,14 +220,15 @@ func (h *Handler) handleStartExam(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Deduplicate questions by text (guards against legacy DB duplicates).
+	// Deduplicate questions by (topic, text_norm) to guard against legacy DB duplicates.
 	seen := make(map[string]bool, len(questions))
 	unique := questions[:0]
 	for _, q := range questions {
-		key := q.TextNorm
-		if key == "" {
-			key = model.NormalizeQuestionText(q.Text)
+		norm := q.TextNorm
+		if norm == "" {
+			norm = model.NormalizeQuestionText(q.Text)
 		}
+		key := questionDupKey(q.Topic, norm)
 		if !seen[key] {
 			seen[key] = true
 			unique = append(unique, q)

@@ -179,26 +179,9 @@ func (s *Store) migrate() error {
 		return err
 	}
 
-	// Remove duplicate questions (keep lowest ID) and remap any threads that
-	// reference deleted duplicates to the canonical (MIN) question ID.
-	_, err = s.db.Exec(`
-		UPDATE question_threads SET question_id = (
-			SELECT MIN(q2.id) FROM questions q2
-			WHERE q2.course_id = (SELECT course_id FROM questions WHERE id = question_threads.question_id)
-			  AND q2.text = (SELECT text FROM questions WHERE id = question_threads.question_id)
-		)
-		WHERE question_id NOT IN (SELECT MIN(id) FROM questions GROUP BY course_id, text)
-	`)
-	if err != nil {
-		return err
-	}
-	_, err = s.db.Exec(`DELETE FROM questions WHERE id NOT IN (SELECT MIN(id) FROM questions GROUP BY course_id, text)`)
-	if err != nil {
-		return err
-	}
-
-	// Prevent duplicate questions (same text within a course).
-	_, err = s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_questions_course_text ON questions(course_id, text)`)
+	// Drop the legacy course-scoped raw-text unique index so identical texts
+	// across different topics and legacy near-duplicates can coexist cleanly.
+	_, err = s.db.Exec(`DROP INDEX IF EXISTS idx_questions_course_text`)
 	if err != nil {
 		return err
 	}
@@ -263,31 +246,19 @@ func (s *Store) populateQuestionTextNorm() error {
 	return nil
 }
 
-// UpdateQuestionByCourseAndText updates a question matched by course_id and text.
-// It returns sql.ErrNoRows if no matching row exists.
-func (s *Store) UpdateQuestionByCourseAndText(q model.Question) error {
-	res, err := s.db.Exec(
-		`UPDATE questions
-		 SET difficulty = ?, topic = ?, rubric = ?, model_answer = ?, max_points = ?
-		 WHERE course_id = ? AND text = ?`,
-		q.Difficulty, q.Topic, q.Rubric, q.ModelAnswer, q.MaxPoints, q.CourseID, q.Text,
-	)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+type sqlExecutor interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
 }
 
 // DeleteUnusedQuestionsByTexts deletes questions whose text is in oldTexts but not in keepTexts
 // and that are not referenced by any question_thread.
 func (s *Store) DeleteUnusedQuestionsByTexts(courseID int, oldTexts, keepTexts []string) error {
+	return deleteUnusedQuestionsByTexts(s.db, courseID, oldTexts, keepTexts)
+}
+
+func deleteUnusedQuestionsByTexts(exec sqlExecutor, courseID int, oldTexts, keepTexts []string) error {
 	if len(oldTexts) == 0 {
 		return nil
 	}
@@ -309,7 +280,7 @@ func (s *Store) DeleteUnusedQuestionsByTexts(courseID int, oldTexts, keepTexts [
 		      SELECT 1 FROM question_threads WHERE question_threads.question_id = questions.id
 		  )`
 
-	_, err := s.db.Exec(query, args...)
+	_, err := exec.Exec(query, args...)
 	return err
 }
 
@@ -321,13 +292,17 @@ func stringsToAny(ss []string) []any {
 	return out
 }
 
-// InsertQuestion stores a question. Duplicate questions (same course_id + text) are silently skipped.
+// InsertQuestion stores a question and returns its new row ID.
 func (s *Store) InsertQuestion(q model.Question) (int64, error) {
+	return insertQuestion(s.db, q)
+}
+
+func insertQuestion(exec sqlExecutor, q model.Question) (int64, error) {
 	if q.TextNorm == "" {
 		q.TextNorm = model.NormalizeQuestionText(q.Text)
 	}
-	res, err := s.db.Exec(
-		`INSERT OR IGNORE INTO questions (course_id, text, text_norm, difficulty, topic, rubric, model_answer, max_points)
+	res, err := exec.Exec(
+		`INSERT INTO questions (course_id, text, text_norm, difficulty, topic, rubric, model_answer, max_points)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		q.CourseID, q.Text, q.TextNorm, q.Difficulty, q.Topic, q.Rubric, q.ModelAnswer, q.MaxPoints,
 	)
@@ -335,13 +310,17 @@ func (s *Store) InsertQuestion(q model.Question) (int64, error) {
 		slog.Error("failed to insert question", "error", err)
 		return 0, err
 	}
-	id, err := res.LastInsertId()
+	n, err := res.RowsAffected()
 	if err != nil {
 		return 0, err
 	}
-	if id == 0 {
+	if n == 0 {
 		slog.Debug("skipped duplicate question", "topic", q.Topic, "difficulty", q.Difficulty)
 		return 0, nil
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
 	}
 	slog.Debug("inserted question", "id", id, "topic", q.Topic, "difficulty", q.Difficulty)
 	return id, nil
@@ -416,11 +395,16 @@ func (s *Store) GetQuestion(id int64) (model.Question, error) {
 
 // FindQuestionByTopicAndTextNorm returns an existing question with matching topic and normalized text.
 func (s *Store) FindQuestionByTopicAndTextNorm(topic, textNorm string) (*model.Question, error) {
+	return findQuestionByTopicAndTextNorm(s.db, topic, textNorm)
+}
+
+func findQuestionByTopicAndTextNorm(exec sqlExecutor, topic, textNorm string) (*model.Question, error) {
 	var q model.Question
-	err := s.db.QueryRow(
+	err := exec.QueryRow(
 		`SELECT id, course_id, text, text_norm, difficulty, topic, rubric, model_answer, max_points
 		 FROM questions
 		 WHERE topic = ? AND text_norm = ?
+		 ORDER BY id ASC
 		 LIMIT 1`,
 		topic, textNorm,
 	).Scan(&q.ID, &q.CourseID, &q.Text, &q.TextNorm, &q.Difficulty, &q.Topic, &q.Rubric, &q.ModelAnswer, &q.MaxPoints)
@@ -433,12 +417,59 @@ func (s *Store) FindQuestionByTopicAndTextNorm(topic, textNorm string) (*model.Q
 	return &q, nil
 }
 
+// FindExistingDuplicates returns groups of existing questions that share the same
+// topic and non-empty normalized text. It is strictly read-only and leaves rows intact
+// so existing question_threads references are never broken.
+func (s *Store) FindExistingDuplicates() ([]model.DuplicateQuestionGroup, error) {
+	rows, err := s.db.Query(`
+		SELECT q.id, q.course_id, q.text, q.text_norm, q.difficulty, q.topic, q.rubric, q.model_answer, q.max_points
+		FROM questions q
+		INNER JOIN (
+			SELECT topic, text_norm
+			FROM questions
+			WHERE text_norm != ''
+			GROUP BY topic, text_norm
+			HAVING COUNT(*) > 1
+		) dup ON q.topic = dup.topic AND q.text_norm = dup.text_norm
+		ORDER BY q.topic ASC, q.text_norm ASC, q.id ASC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var groups []model.DuplicateQuestionGroup
+	for rows.Next() {
+		var q model.Question
+		if err := rows.Scan(&q.ID, &q.CourseID, &q.Text, &q.TextNorm, &q.Difficulty, &q.Topic, &q.Rubric, &q.ModelAnswer, &q.MaxPoints); err != nil {
+			return nil, err
+		}
+		n := len(groups)
+		if n == 0 || groups[n-1].Topic != q.Topic || groups[n-1].TextNorm != q.TextNorm {
+			groups = append(groups, model.DuplicateQuestionGroup{
+				Topic:    q.Topic,
+				TextNorm: q.TextNorm,
+			})
+			n++
+		}
+		groups[n-1].Questions = append(groups[n-1].Questions, q)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return groups, nil
+}
+
 // UpdateQuestion updates an existing question by its ID.
 func (s *Store) UpdateQuestion(q model.Question) error {
+	return updateQuestion(s.db, q)
+}
+
+func updateQuestion(exec sqlExecutor, q model.Question) error {
 	if q.TextNorm == "" {
 		q.TextNorm = model.NormalizeQuestionText(q.Text)
 	}
-	res, err := s.db.Exec(
+	res, err := exec.Exec(
 		`UPDATE questions
 		 SET text = ?, text_norm = ?, difficulty = ?, topic = ?, rubric = ?, model_answer = ?, max_points = ?
 		 WHERE id = ?`,
@@ -455,6 +486,75 @@ func (s *Store) UpdateQuestion(q model.Question) error {
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+// TeacherQuestionUploadItem represents a deduplicated question candidate in a teacher upload.
+type TeacherQuestionUploadItem struct {
+	QuestionIndex int // 1-based position in the uploaded payload
+	Question      model.Question
+	Owned         bool
+}
+
+// TeacherQuestionSkip describes a question skipped during SaveTeacherQuestions because
+// it matched an existing question not owned by the uploading teacher.
+type TeacherQuestionSkip struct {
+	QuestionIndex int
+	ExistingID    int64
+	Topic         string
+}
+
+// SaveTeacherQuestions atomically saves or updates a teacher's uploaded questions
+// and removes unused questions from oldTexts within a single transaction.
+func (s *Store) SaveTeacherQuestions(courseID int, items []TeacherQuestionUploadItem, oldTexts []string) (savedIndices []int, skips []TeacherQuestionSkip, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	keepTexts := make([]string, 0, len(items))
+	for _, it := range items {
+		q := it.Question
+		if q.TextNorm == "" {
+			q.TextNorm = model.NormalizeQuestionText(q.Text)
+		}
+
+		existing, err := findQuestionByTopicAndTextNorm(tx, q.Topic, q.TextNorm)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if existing != nil {
+			if !it.Owned {
+				skips = append(skips, TeacherQuestionSkip{
+					QuestionIndex: it.QuestionIndex,
+					ExistingID:    existing.ID,
+					Topic:         q.Topic,
+				})
+				continue
+			}
+			q.ID = existing.ID
+			if err := updateQuestion(tx, q); err != nil {
+				return nil, nil, err
+			}
+		} else {
+			if _, err := insertQuestion(tx, q); err != nil {
+				return nil, nil, err
+			}
+		}
+
+		savedIndices = append(savedIndices, it.QuestionIndex)
+		keepTexts = append(keepTexts, q.Text)
+	}
+
+	if err := deleteUnusedQuestionsByTexts(tx, courseID, oldTexts, keepTexts); err != nil {
+		return nil, nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	return savedIndices, skips, nil
 }
 
 // CreateBlueprint creates an exam blueprint.
