@@ -13,38 +13,12 @@ import (
 	"github.com/pavelanni/examiner/internal/i18n"
 	"github.com/pavelanni/examiner/internal/model"
 	"github.com/pavelanni/examiner/internal/store"
-	jsonschema "github.com/santhosh-tekuri/jsonschema/v5"
 )
-
-func compileTestQuestionSchema(t *testing.T) *jsonschema.Schema {
-	t.Helper()
-	absSchema, err := filepath.Abs("../../schema/question_schema.json")
-	if err != nil {
-		t.Fatalf("filepath.Abs: %v", err)
-	}
-	compiler := jsonschema.NewCompiler()
-	f, err := os.Open(absSchema)
-	if err != nil {
-		t.Fatalf("os.Open(%s): %v", absSchema, err)
-	}
-	defer func() { _ = f.Close() }()
-	schemaURL := "file://" + filepath.ToSlash(absSchema)
-	if err := compiler.AddResource(schemaURL, f); err != nil {
-		t.Fatalf("AddResource: %v", err)
-	}
-	schema, err := compiler.Compile(schemaURL)
-	if err != nil {
-		t.Fatalf("Compile schema: %v", err)
-	}
-	return schema
-}
 
 func TestTeacherUploadDuplicateProtection(t *testing.T) {
 	if err := i18n.Init("en"); err != nil {
 		t.Fatalf("i18n.Init: %v", err)
 	}
-
-	schema := compileTestQuestionSchema(t)
 
 	tmpDir := t.TempDir()
 	t.Chdir(tmpDir)
@@ -58,8 +32,11 @@ func TestTeacherUploadDuplicateProtection(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	h := &Handler{store: s, questionSchema: schema}
-	teacher := &model.User{ID: 2, Username: "alice", DisplayName: "Alice", Role: model.UserRoleTeacher}
+	h := &Handler{store: s}
+	teacher := &model.User{Username: "alice", DisplayName: "Alice", PasswordHash: "x", Role: model.UserRoleTeacher, Active: true}
+	if teacher.ID, err = s.CreateUser(*teacher); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
 
 	postTeacherJSON := func(questionsJSON, customFilename, editingFile, lang string) *httptest.ResponseRecorder {
 		var body bytes.Buffer
@@ -92,7 +69,7 @@ func TestTeacherUploadDuplicateProtection(t *testing.T) {
 	if rec1.Code != http.StatusOK {
 		t.Fatalf("expected 200 OK with warning banner, got %d (%s)", rec1.Code, rec1.Body.String())
 	}
-	if !strings.Contains(rec1.Body.String(), "matches question #1 in the file under topic") {
+	if !strings.Contains(rec1.Body.String(), "Question 2 duplicates question 1 in this file") {
 		t.Errorf("expected English intra-file duplicate warning, got: %s", rec1.Body.String())
 	}
 	count, err := s.QuestionCount()
@@ -126,7 +103,7 @@ func TestTeacherUploadDuplicateProtection(t *testing.T) {
 		t.Errorf("expected own question to be updated, got %+v", found)
 	}
 
-	// 3. Question already in DB from another source (e.g. admin import) is NOT overwritten and warns in RU.
+	// 3. Question already in DB from another source (e.g. admin import) is NOT overwritten: the save is rejected in RU.
 	adminQID, err := s.InsertQuestion(model.Question{
 		CourseID:    1,
 		Text:        "What is Kubernetes?",
@@ -144,11 +121,11 @@ func TestTeacherUploadDuplicateProtection(t *testing.T) {
 		{"text": "what is kubernetes", "difficulty": "hard", "topic": "devops", "rubric": "hijacked", "model_answer": "hijacked", "max_points": 1}
 	]`
 	rec3 := postTeacherJSON(conflictJSON, "devops_quiz", "", "ru")
-	if rec3.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK with warning banner, got %d", rec3.Code)
+	if rec3.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with the ownership conflict, got %d", rec3.Code)
 	}
-	if !strings.Contains(rec3.Body.String(), "совпадает с существующим вопросом #") {
-		t.Errorf("expected Russian DB duplicate warning, got: %s", rec3.Body.String())
+	if !strings.Contains(rec3.Body.String(), "уберите его из файла") {
+		t.Errorf("expected Russian ownership conflict, got: %s", rec3.Body.String())
 	}
 	adminQ, err := s.GetQuestion(adminQID)
 	if err != nil {
@@ -182,17 +159,17 @@ func TestStartExamDeduplicatesByTextNorm(t *testing.T) {
 		t.Fatalf("CreateBlueprint: %v", err)
 	}
 	if _, err := s.InsertQuestion(model.Question{
-		CourseID: 1, Text: "What is Go?", Difficulty: model.DifficultyEasy, Topic: "go", MaxPoints: 5,
+		CourseID: 1, Text: "What is Go?", Difficulty: model.DifficultyEasy, Topic: "go", MaxPoints: 5, Published: true,
 	}); err != nil {
 		t.Fatalf("InsertQuestion 1: %v", err)
 	}
 	if _, err := s.InsertQuestion(model.Question{
-		CourseID: 2, Text: "what is go", Difficulty: model.DifficultyEasy, Topic: "go", MaxPoints: 5,
+		CourseID: 2, Text: "what is go", Difficulty: model.DifficultyEasy, Topic: "go", MaxPoints: 5, Published: true,
 	}); err != nil {
 		t.Fatalf("InsertQuestion 2: %v", err)
 	}
 	if _, err := s.InsertQuestion(model.Question{
-		CourseID: 1, Text: "What is Go?", Difficulty: model.DifficultyEasy, Topic: "history", MaxPoints: 5,
+		CourseID: 1, Text: "What is Go?", Difficulty: model.DifficultyEasy, Topic: "history", MaxPoints: 5, Published: true,
 	}); err != nil {
 		t.Fatalf("InsertQuestion 3 (different topic): %v", err)
 	}
@@ -232,9 +209,6 @@ func TestTeacherUploadRedirectRespectsBasePath(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	// Change to repository root so compileQuestionSchema() finds schema/question_schema.json.
-	t.Chdir(filepath.Join("..", ".."))
-
 	basePath := "/ru"
 	cfg := model.ExamConfig{
 		BasePath: basePath,
@@ -264,7 +238,10 @@ func TestTeacherUploadRedirectRespectsBasePath(t *testing.T) {
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	// Authenticate request as a teacher user (including Username for file naming).
-	teacherUser := &model.User{ID: 1, Username: "teacher1", Role: model.UserRoleTeacher}
+	teacherUser := &model.User{Username: "teacher1", PasswordHash: "x", Role: model.UserRoleTeacher, Active: true}
+	if teacherUser.ID, err = s.CreateUser(*teacherUser); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
 	ctx := i18n.WithLocalizer(model.ContextWithUser(req.Context(), teacherUser), i18n.NewLocalizer("en"))
 	req = req.WithContext(ctx)
 
@@ -290,7 +267,6 @@ func TestTeacherUploadRenameUsesBaseName(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	t.Chdir(filepath.Join("..", ".."))
 	h, err := New(s, nil, model.ExamConfig{})
 	if err != nil {
 		t.Fatal(err)
@@ -325,7 +301,11 @@ func TestTeacherUploadRenameUsesBaseName(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "/teacher/tests", &body)
 	req.Header.Set("Content-Type", form.FormDataContentType())
-	req = req.WithContext(model.ContextWithUser(req.Context(), &model.User{Username: "alice", Role: model.UserRoleTeacher}))
+	alice := &model.User{Username: "alice", PasswordHash: "x", Role: model.UserRoleTeacher, Active: true}
+	if alice.ID, err = s.CreateUser(*alice); err != nil {
+		t.Fatal(err)
+	}
+	req = req.WithContext(model.ContextWithUser(req.Context(), alice))
 	rec := httptest.NewRecorder()
 	h.handleTeacherUpload(rec, req)
 	if rec.Code != http.StatusSeeOther {

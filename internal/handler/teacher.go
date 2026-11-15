@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,68 +15,80 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/pavelanni/examiner/internal/access"
 	"github.com/pavelanni/examiner/internal/handler/views"
 	appI18n "github.com/pavelanni/examiner/internal/i18n"
 	"github.com/pavelanni/examiner/internal/model"
+	"github.com/pavelanni/examiner/internal/questionimport"
 	"github.com/pavelanni/examiner/internal/store"
 )
 
-func teacherQuestionFilePrefix(username string) string {
-	return fmt.Sprintf("teacher_%s_", username)
+// ownsQuestionFile reports whether user owns the question file name under
+// the shared longest-prefix rule (access.QuestionFileOwner).
+func (h *Handler) ownsQuestionFile(user *model.User, name string) (bool, error) {
+	users, err := h.store.ListUsers()
+	if err != nil {
+		return false, err
+	}
+	owner := access.QuestionFileOwner(users, filepath.Base(name))
+	return owner != nil && owner.ID == user.ID, nil
 }
 
-func teacherOwnsQuestionFile(username, filename string) bool {
-	return strings.HasPrefix(filepath.Base(filename), teacherQuestionFilePrefix(username))
+// checkQuestionFileOwner writes 403 (or 500) and returns false unless user
+// owns the question file name.
+func (h *Handler) checkQuestionFileOwner(w http.ResponseWriter, user *model.User, name string) bool {
+	ok, err := h.ownsQuestionFile(user, name)
+	if err != nil {
+		slog.Error("failed to check question file owner", "file", name, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return false
+	}
+	if !ok {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
-func listTeacherFiles(username string) []string {
+// listOwnedQuestionFiles returns the question files user owns.
+func (h *Handler) listOwnedQuestionFiles(user *model.User) ([]string, error) {
 	files := []string{}
 	entries, err := os.ReadDir("questions")
 	if err != nil {
-		return files
+		return files, nil
 	}
-	prefix := teacherQuestionFilePrefix(username)
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
 			continue
 		}
-		name := e.Name()
-		if filepath.Ext(name) == ".json" && strings.HasPrefix(name, prefix) {
-			files = append(files, name)
-		}
-	}
-	return files
-}
-
-func teacherOwnedQuestionKeys(username string, oldQuestions []model.QuestionImport) map[string]struct{} {
-	owned := make(map[string]struct{}, len(oldQuestions))
-	for _, q := range oldQuestions {
-		owned[questionDupKey(q.Topic, model.NormalizeQuestionText(q.Text))] = struct{}{}
-	}
-	for _, name := range listTeacherFiles(username) {
-		b, err := os.ReadFile(filepath.Join("questions", name))
+		ok, err := h.ownsQuestionFile(user, e.Name())
 		if err != nil {
-			continue
+			return nil, err
 		}
-		for _, q := range parseQuestionsFromJSON(b) {
-			owned[questionDupKey(q.Topic, model.NormalizeQuestionText(q.Text))] = struct{}{}
+		if ok {
+			files = append(files, e.Name())
 		}
 	}
-	return owned
+	return files, nil
 }
 
-func parseQuestionsFromJSON(data []byte) []model.QuestionImport {
-	var questions []model.QuestionImport
-	if err := json.Unmarshal(data, &questions); err == nil {
-		return questions
+// draftsToImports returns the decoded questions for prefilling the constructor.
+func draftsToImports(drafts []questionimport.Draft) []model.QuestionImport {
+	out := make([]model.QuestionImport, 0, len(drafts))
+	for _, d := range drafts {
+		out = append(out, d.QuestionImport)
 	}
-	var wrapper struct {
-		Questions []model.QuestionImport `json:"questions"`
+	return out
+}
+
+func (h *Handler) renderTeacherCreateTest(w http.ResponseWriter, r *http.Request, status int, questions []model.QuestionImport, filename, customName string, published bool, errs []string) {
+	user := model.UserFromContext(r.Context())
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	component := views.TeacherCreateTestPage(user.DisplayName, model.CSRFTokenFromContext(r.Context()), questions, filename, customName, published, errs)
+	if err := component.Render(r.Context(), w); err != nil {
+		slog.Error("render error", "error", err)
 	}
-	if err := json.Unmarshal(data, &wrapper); err == nil {
-		return wrapper.Questions
-	}
-	return nil
 }
 
 func (h *Handler) handleTeacherProfile(w http.ResponseWriter, r *http.Request) {
@@ -85,7 +98,12 @@ func (h *Handler) handleTeacherProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	files := listTeacherFiles(user.Username)
+	files, err := h.listOwnedQuestionFiles(user)
+	if err != nil {
+		slog.Error("failed to check question file owner", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := views.TeacherProfilePage(user.DisplayName, files, "").Render(r.Context(), w); err != nil {
@@ -105,26 +123,38 @@ func (h *Handler) handleTeacherCreateTest(w http.ResponseWriter, r *http.Request
 
 	if filename != "" {
 		baseName := filepath.Base(filename)
-		if !teacherOwnsQuestionFile(user.Username, baseName) {
-			http.Error(w, "forbidden", http.StatusForbidden)
+		if !h.checkQuestionFileOwner(w, user, baseName) {
 			return
 		}
 		filePath := filepath.Join("questions", baseName)
 
 		fileBytes, err := os.ReadFile(filePath)
 		if err == nil {
-			existingQuestions = parseQuestionsFromJSON(fileBytes)
+			// Prefill whatever can be read; saving validates again.
+			drafts, _ := questionimport.Decode(fileBytes)
+			existingQuestions = draftsToImports(drafts)
 		} else {
 			slog.Warn("failed to read file for editing", "file", filePath, "error", err)
 		}
 	}
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-
-	component := views.TeacherCreateTestPage(user.DisplayName, model.CSRFTokenFromContext(r.Context()), existingQuestions, filename)
-	if err := component.Render(r.Context(), w); err != nil {
-		slog.Error("render error", "error", err)
+	// A new file is published by default; an existing one keeps the state
+	// of the teacher's questions in it, so saving does not republish it.
+	published := true
+	if len(existingQuestions) > 0 {
+		keys := make([]store.QuestionKey, 0, len(existingQuestions))
+		for _, q := range existingQuestions {
+			keys = append(keys, store.QuestionKey{Topic: q.Topic, TextNorm: model.NormalizeQuestionText(q.Text)})
+		}
+		var err error
+		if published, err = h.store.AllPublished(user.ID, keys); err != nil {
+			slog.Error("failed to read publication state", "file", filename, "error", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
 	}
+
+	h.renderTeacherCreateTest(w, r, http.StatusOK, existingQuestions, filename, "", published, nil)
 }
 
 func (h *Handler) handleTeacherMe(w http.ResponseWriter, r *http.Request) {
@@ -150,8 +180,13 @@ func (h *Handler) handleTeacherUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var data []byte
+	user := model.UserFromContext(r.Context())
+	if user == nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 
+	var data []byte
 	file, _, err := r.FormFile("questions_file")
 	if err == nil {
 		defer func() { _ = file.Close() }()
@@ -170,41 +205,6 @@ func (h *Handler) handleTeacherUpload(w http.ResponseWriter, r *http.Request) {
 		data = []byte(txt)
 	}
 
-	// Validate the JSON structure against the compiled schema.
-	var v interface{}
-	if err := json.Unmarshal(data, &v); err != nil {
-		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if err := h.questionSchema.Validate(v); err != nil {
-		http.Error(w, "schema validation failed: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	var questions []model.QuestionImport
-	if err := json.Unmarshal(data, &questions); err != nil {
-		var wrapper struct {
-			TestName        string                 `json:"test_name"`
-			TestDescription string                 `json:"test_description"`
-			DefaultTopic    string                 `json:"default_topic"`
-			Questions       []model.QuestionImport `json:"questions"`
-		}
-		if err := json.Unmarshal(data, &wrapper); err != nil {
-			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-		questions = wrapper.Questions
-	}
-	if len(questions) == 0 {
-		http.Error(w, "no questions found in JSON", http.StatusBadRequest)
-		return
-	}
-
-	user := model.UserFromContext(r.Context())
-	if user == nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
 	editingFile := r.FormValue("editing_file")
 	if editingFile != "" {
 		editingFile = filepath.Base(editingFile)
@@ -213,19 +213,26 @@ func (h *Handler) handleTeacherUpload(w http.ResponseWriter, r *http.Request) {
 	defer h.teacherUploadMu.Unlock()
 	var oldPath string
 	customFilename := strings.TrimSpace(r.FormValue("custom_filename"))
+	published := r.FormValue("publish") == "1"
+
+	// Validate the whole payload before touching the disk or the DB.
+	drafts, errs := questionimport.Parse(data)
+	if len(errs) > 0 {
+		h.renderTeacherCreateTest(w, r, http.StatusBadRequest, draftsToImports(drafts), editingFile, customFilename, published,
+			questionimport.Localize(r.Context(), errs))
+		return
+	}
 
 	var safeName string
-	var outPath string
-	var oldQuestions []model.QuestionImport
+	var oldDrafts []questionimport.Draft
 
 	if editingFile != "" {
-		if !teacherOwnsQuestionFile(user.Username, editingFile) {
-			http.Error(w, "forbidden", http.StatusForbidden)
+		if !h.checkQuestionFileOwner(w, user, editingFile) {
 			return
 		}
 		oldPath = filepath.Join("questions", editingFile)
 		if oldBytes, err := os.ReadFile(oldPath); err == nil {
-			oldQuestions = parseQuestionsFromJSON(oldBytes)
+			oldDrafts, _ = questionimport.Decode(oldBytes)
 		}
 		if customFilename != "" {
 			base := filepath.Base(customFilename)
@@ -234,7 +241,6 @@ func (h *Handler) handleTeacherUpload(w http.ResponseWriter, r *http.Request) {
 		} else {
 			safeName = editingFile
 		}
-		outPath = filepath.Join("questions", safeName)
 	} else {
 		if customFilename != "" {
 			base := filepath.Base(customFilename)
@@ -243,101 +249,113 @@ func (h *Handler) handleTeacherUpload(w http.ResponseWriter, r *http.Request) {
 		} else {
 			safeName = fmt.Sprintf("teacher_%s_%d.json", user.Username, time.Now().Unix())
 		}
-		outPath = filepath.Join("questions", safeName)
 	}
-
-	// Collect questions already owned by this teacher before writing outPath.
-	ownedKeys := teacherOwnedQuestionKeys(user.Username, oldQuestions)
-
-	var warnings []string
-	var candidates []store.TeacherQuestionUploadItem
-	seenInUpload := make(map[string]int, len(questions)) // topic + "\x00" + text_norm -> 1-based question number
-
-	for i, qi := range questions {
-		qNum := i + 1
-		norm := model.NormalizeQuestionText(qi.Text)
-		key := questionDupKey(qi.Topic, norm)
-
-		// Check duplicate within the uploaded questions.
-		if prevNum, seen := seenInUpload[key]; seen {
-			warnings = append(warnings, appI18n.Td(r.Context(), "UploadDuplicateInFile", map[string]any{
-				"Num":     qNum,
-				"PrevNum": prevNum,
-				"Topic":   qi.Topic,
-			}))
-			continue
-		}
-		seenInUpload[key] = qNum
-
-		_, owned := ownedKeys[key]
-		candidates = append(candidates, store.TeacherQuestionUploadItem{
-			QuestionIndex: qNum,
-			Owned:         owned,
-			Question: model.Question{
-				// TODO: derive course ID from context/config when multi-course support lands.
-				CourseID:    1,
-				Text:        qi.Text,
-				TextNorm:    norm,
-				Difficulty:  qi.Difficulty,
-				Topic:       qi.Topic,
-				Rubric:      qi.Rubric,
-				ModelAnswer: qi.ModelAnswer,
-				MaxPoints:   qi.MaxPoints,
-			},
-		})
+	// Reject a name the file system would refuse before anything is
+	// written.
+	if !validQuestionFileName(safeName) {
+		h.renderTeacherCreateTest(w, r, http.StatusBadRequest, draftsToImports(drafts), editingFile, customFilename, published,
+			[]string{appI18n.T(r.Context(), "QImportErrFileName")})
+		return
 	}
+	// The new name must stay in the user's own namespace: with users ivan
+	// and ivan_mid, ivan saving "mid_exam" would create ivan_mid's file.
+	if ok, err := h.ownsQuestionFile(user, safeName); err != nil {
+		slog.Error("failed to check question file owner", "file", safeName, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	} else if !ok {
+		h.renderTeacherCreateTest(w, r, http.StatusBadRequest, draftsToImports(drafts), editingFile, customFilename, published,
+			[]string{appI18n.T(r.Context(), "QImportErrFileNameTaken")})
+		return
+	}
+	outPath := filepath.Join("questions", safeName)
 
-	var savedIndices []int
-	var skips []store.TeacherQuestionSkip
+	// The file is published (and a renamed file retired) as the last step
+	// of the transaction. A failed publish rolls the transaction back; a
+	// failed commit makes saveTeacherQuestionFile restore the files.
+	var res questionimport.Result
 	err = saveTeacherQuestionFile(oldPath, outPath, func(publish func([]byte) error) error {
-		var saveErr error
-		savedIndices, skips, saveErr = h.store.SaveTeacherQuestionFile(1, candidates, oldQuestions, editingFile, safeName, func(indices []int) (string, error) {
-			writtenData := data
-			if len(indices) < len(questions) {
-				saved := make([]model.QuestionImport, 0, len(indices))
-				for _, index := range indices {
-					saved = append(saved, questions[index-1])
-				}
-				encoded, err := json.MarshalIndent(saved, "", "  ")
-				if err != nil {
-					return "", err
-				}
-				writtenData = encoded
+		return h.store.InQuestionTx(r.Context(), func(tx *store.QuestionTx) error {
+			var err error
+			res, err = questionimport.Apply(tx, drafts, questionimport.Options{
+				Mode: questionimport.ModeUpdateExisting,
+				// TODO: derive course ID from context/config when multi-course support lands.
+				CourseID:  1,
+				Old:       oldDrafts,
+				Actor:     user,
+				Published: published,
+			})
+			if err != nil {
+				return err
 			}
-			if err := publish(writtenData); err != nil {
-				return "", err
+			// The file holds only the saved questions: a duplicate within
+			// the file is left out.
+			written, err := savedQuestionsFile(data, drafts, res.Saved)
+			if err != nil {
+				return err
 			}
-			sum := sha256.Sum256(writtenData)
-			return hex.EncodeToString(sum[:]), nil
+			if editingFile != "" && editingFile != safeName {
+				if err := tx.DeleteImportedFileHash(editingFile); err != nil {
+					return err
+				}
+			}
+			sum := sha256.Sum256(written)
+			if err := tx.SetImportedFileHash(safeName, hex.EncodeToString(sum[:])); err != nil {
+				return err
+			}
+			return publish(written)
 		})
-		return saveErr
 	})
+	var conflict *questionimport.ConflictError
+	switch {
+	case err == nil:
+	case errors.As(err, &conflict):
+		h.renderTeacherCreateTest(w, r, http.StatusBadRequest, draftsToImports(drafts), editingFile, customFilename, published,
+			questionimport.Localize(r.Context(), conflict.Errs))
+		return
+	default:
+		slog.Error("failed to save questions", "user", user.Username, "file", outPath, "error", err)
+		h.renderTeacherCreateTest(w, r, http.StatusInternalServerError, draftsToImports(drafts), editingFile, customFilename, published,
+			[]string{appI18n.T(r.Context(), "QImportErrInternal")})
+		return
+	}
+
+	warnings := questionimport.LocalizeWarnings(r.Context(), res.Warnings)
+	slog.Info("teacher uploaded questions", "user", user.Username, "file", outPath,
+		"inserted", res.Inserted, "updated", res.Updated, "skipped", res.Skipped)
+	if len(warnings) == 0 {
+		http.Redirect(w, r, h.path("/teacher/profile"), http.StatusSeeOther)
+		return
+	}
+	msg := appI18n.Td(r.Context(), "QImportSummary", map[string]any{
+		"Inserted": res.Inserted, "Updated": res.Updated, "Skipped": res.Skipped,
+	}) + " " + strings.Join(warnings, " ")
+	files, err := h.listOwnedQuestionFiles(user)
 	if err != nil {
-		slog.Error("failed to save teacher questions", "error", err)
-		http.Error(w, "failed to save questions", http.StatusInternalServerError)
-		return
+		// The save succeeded; show the message without the file list.
+		slog.Error("failed to check question file owner", "error", err)
 	}
-
-	for _, skip := range skips {
-		warnings = append(warnings, appI18n.Td(r.Context(), "UploadDuplicateInDB", map[string]any{
-			"Num": skip.QuestionIndex, "ID": skip.ExistingID, "Topic": skip.Topic,
-		}))
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := views.TeacherProfilePage(user.DisplayName, files, msg).Render(r.Context(), w); err != nil {
+		slog.Error("render error", "error", err)
 	}
-	savedCount := len(savedIndices)
+}
 
-	slog.Info("teacher uploaded questions", "user", user.Username, "file", outPath, "saved", savedCount, "warnings", len(warnings))
-
-	if len(warnings) > 0 {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		msg := formatUploadSummary(r.Context(), savedCount, warnings)
-		if err := views.TeacherProfilePage(user.DisplayName, listTeacherFiles(user.Username), msg).Render(r.Context(), w); err != nil {
-			slog.Error("render error", "error", err)
-		}
-		return
+// savedQuestionsFile returns the file content to publish: data itself when
+// every question was saved, otherwise only the saved ones.
+func savedQuestionsFile(data []byte, drafts []questionimport.Draft, saved []int) ([]byte, error) {
+	if len(saved) == len(drafts) {
+		return data, nil
 	}
-
-	// Automatically redirect to teacher's profile
-	http.Redirect(w, r, h.path("/teacher/profile"), http.StatusSeeOther)
+	byNumber := make(map[int]model.QuestionImport, len(drafts))
+	for _, d := range drafts {
+		byNumber[d.Number] = d.QuestionImport
+	}
+	out := make([]model.QuestionImport, 0, len(saved))
+	for _, n := range saved {
+		out = append(out, byNumber[n])
+	}
+	return json.MarshalIndent(out, "", "  ")
 }
 
 func (h *Handler) handleTeacherDownload(w http.ResponseWriter, r *http.Request) {
@@ -355,10 +373,23 @@ func (h *Handler) handleTeacherDownload(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "invalid filename", http.StatusBadRequest)
 		return
 	}
-	if !teacherOwnsQuestionFile(user.Username, name) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if !h.checkQuestionFileOwner(w, user, name) {
 		return
 	}
 	path := filepath.Join("questions", name)
 	http.ServeFile(w, r, path)
+}
+
+// validQuestionFileName reports whether name can be created on both Linux
+// and Windows: at most 255 bytes, no control characters, none of <>:"/\|?*.
+func validQuestionFileName(name string) bool {
+	if len(name) > 255 {
+		return false
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f || strings.ContainsRune(`<>:"/\|?*`, r) {
+			return false
+		}
+	}
+	return true
 }

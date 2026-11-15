@@ -30,6 +30,7 @@ func insertTestQuestion(t *testing.T, s *Store, text, difficulty, topic string) 
 		Rubric:      "rubric for " + text,
 		ModelAnswer: "answer for " + text,
 		MaxPoints:   10,
+		Published:   true,
 	})
 	if err != nil {
 		t.Fatalf("insertTestQuestion: %v", err)
@@ -95,6 +96,51 @@ func TestQuestionCRUD(t *testing.T) {
 	}
 	if count != 2 {
 		t.Fatalf("expected count 2, got %d", count)
+	}
+}
+
+func TestInsertQuestionUnpublished(t *testing.T) {
+	s := newTestStore(t)
+	id, err := s.InsertQuestion(model.Question{
+		CourseID: 1, Text: "Draft", Difficulty: model.DifficultyEasy, Topic: "hidden",
+		Rubric: "r", ModelAnswer: "a", MaxPoints: 10, Published: false,
+	})
+	if err != nil {
+		t.Fatalf("InsertQuestion: %v", err)
+	}
+	q, err := s.GetQuestion(id)
+	if err != nil || q.Published {
+		t.Errorf("GetQuestion = published %v, %v; want unpublished", q.Published, err)
+	}
+	topics, err := s.ListPublishedTopics()
+	if err != nil || len(topics) != 0 {
+		t.Errorf("ListPublishedTopics = %v, %v; want none", topics, err)
+	}
+}
+
+func TestCreateSessionRejectsUnpublished(t *testing.T) {
+	s := newTestStore(t)
+	bpID, err := s.CreateBlueprint(model.ExamBlueprint{CourseID: 1, Name: "T"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := insertTestQuestion(t, s, "Published", "easy", "t")
+	unpub, err := s.InsertQuestion(model.Question{
+		CourseID: 1, Text: "Unpublished", Difficulty: model.DifficultyEasy, Topic: "t",
+		Rubric: "r", ModelAnswer: "a", MaxPoints: 10, Published: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateSession(bpID, 1, []int64{pub, unpub}); err == nil {
+		t.Fatal("CreateSession with an unpublished question: want error")
+	}
+	if _, err := s.CreateSession(bpID, 1, []int64{pub, 9999}); err == nil {
+		t.Fatal("CreateSession with a missing question: want error")
+	}
+	sessions, err := s.ListSessions()
+	if err != nil || len(sessions) != 0 {
+		t.Errorf("sessions = %v, %v; want none (rolled back)", sessions, err)
 	}
 }
 
@@ -489,60 +535,13 @@ func TestImportedFileHash(t *testing.T) {
 	}
 }
 
-func TestDeleteUnusedQuestionsByTexts(t *testing.T) {
-	s := newTestStore(t)
-
-	insert := func(text string) int64 {
-		id, err := s.InsertQuestion(model.Question{
-			CourseID:    1,
-			Text:        text,
-			Difficulty:  model.DifficultyEasy,
-			Topic:       "go",
-			Rubric:      "r",
-			ModelAnswer: "a",
-			MaxPoints:   1,
-		})
-		if err != nil {
-			t.Fatalf("insert %q: %v", text, err)
-		}
-		return id
-	}
-
-	idKept := insert("kept")
-	idRemoved := insert("removed")
-	idReferenced := insert("referenced")
-
-	bpID, err := s.CreateBlueprint(model.ExamBlueprint{Name: "test", TimeLimit: 10, MaxFollowups: 0})
-	if err != nil {
-		t.Fatalf("create blueprint: %v", err)
-	}
-	_, err = s.CreateSession(bpID, 1, []int64{idReferenced})
-	if err != nil {
-		t.Fatalf("create session: %v", err)
-	}
-
-	if err := s.DeleteUnusedQuestionsByTexts(1, []string{"kept", "removed", "referenced"}, []string{"kept"}); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-
-	if _, err := s.GetQuestion(idRemoved); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("expected removed question to be deleted, got err=%v", err)
-	}
-	if _, err := s.GetQuestion(idKept); err != nil {
-		t.Fatalf("expected kept question to remain: %v", err)
-	}
-	if _, err := s.GetQuestion(idReferenced); err != nil {
-		t.Fatalf("expected referenced question to remain: %v", err)
-	}
-}
-
-func TestListDistinctTopics(t *testing.T) {
+func TestListPublishedTopics(t *testing.T) {
 	s := newTestStore(t)
 
 	// Empty DB.
-	topics, err := s.ListDistinctTopics()
+	topics, err := s.ListPublishedTopics()
 	if err != nil {
-		t.Fatalf("ListDistinctTopics: %v", err)
+		t.Fatalf("ListPublishedTopics: %v", err)
 	}
 	if len(topics) != 0 {
 		t.Errorf("expected 0 topics, got %d", len(topics))
@@ -550,7 +549,7 @@ func TestListDistinctTopics(t *testing.T) {
 
 	// Single topic.
 	insertTestQuestion(t, s, "Q1", "easy", "basics")
-	topics, _ = s.ListDistinctTopics()
+	topics, _ = s.ListPublishedTopics()
 	if len(topics) != 1 || topics[0] != "basics" {
 		t.Errorf("expected [basics], got %v", topics)
 	}
@@ -559,7 +558,7 @@ func TestListDistinctTopics(t *testing.T) {
 	insertTestQuestion(t, s, "Q2", "easy", "basics")
 	insertTestQuestion(t, s, "Q3", "easy", "concurrency")
 	insertTestQuestion(t, s, "Q4", "easy", "advanced")
-	topics, _ = s.ListDistinctTopics()
+	topics, _ = s.ListPublishedTopics()
 	if len(topics) != 3 {
 		t.Errorf("expected 3 distinct topics, got %d: %v", len(topics), topics)
 	}
@@ -881,62 +880,6 @@ func TestFindExistingDuplicates(t *testing.T) {
 	}
 	if _, err := s.GetQuestion(id2); err != nil {
 		t.Fatalf("archived question must remain readable: %v", err)
-	}
-}
-
-func TestSaveTeacherQuestionsAtomicAndCrossTopic(t *testing.T) {
-	s := newTestStore(t)
-
-	// Cross-topic identical text should be allowed independently.
-	idA, err := s.InsertQuestion(model.Question{
-		CourseID: 1, Text: "What is state?", Difficulty: model.DifficultyEasy, Topic: "react", MaxPoints: 5,
-	})
-	if err != nil || idA == 0 {
-		t.Fatalf("InsertQuestion topic A: id=%d err=%v", idA, err)
-	}
-	idB, err := s.InsertQuestion(model.Question{
-		CourseID: 1, Text: "What is state?", Difficulty: model.DifficultyEasy, Topic: "redux", MaxPoints: 5,
-	})
-	if err != nil || idB == 0 || idB == idA {
-		t.Fatalf("InsertQuestion topic B: id=%d err=%v", idB, err)
-	}
-
-	// Verify SaveTeacherQuestions rolls back everything if an operation fails mid-transaction.
-	if _, err := s.db.Exec(`
-		CREATE TRIGGER fail_tx_question BEFORE INSERT ON questions
-		WHEN NEW.text = 'FAIL_TX'
-		BEGIN
-			SELECT RAISE(ABORT, 'simulated mid-tx failure');
-		END
-	`); err != nil {
-		t.Fatalf("create trigger: %v", err)
-	}
-	items := []TeacherQuestionUploadItem{
-		{
-			QuestionIndex: 1,
-			Owned:         false,
-			Question: model.Question{
-				CourseID: 1, Text: "Valid atomic question?", Difficulty: model.DifficultyEasy, Topic: "tx", MaxPoints: 5,
-			},
-		},
-		{
-			QuestionIndex: 2,
-			Owned:         false,
-			Question: model.Question{
-				CourseID: 1, Text: "FAIL_TX", Difficulty: model.DifficultyEasy, Topic: "tx", MaxPoints: 5,
-			},
-		},
-	}
-	if _, _, err := s.SaveTeacherQuestions(1, items, nil); err == nil {
-		t.Fatal("expected SaveTeacherQuestions to fail on trigger")
-	}
-
-	found, err := s.FindQuestionByTopicAndTextNorm(1, "tx", model.NormalizeQuestionText("Valid atomic question?"))
-	if err != nil {
-		t.Fatalf("FindQuestionByTopicAndTextNorm: %v", err)
-	}
-	if found != nil {
-		t.Fatalf("expected rollback to remove question 1, but found %+v", found)
 	}
 }
 

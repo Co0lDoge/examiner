@@ -10,20 +10,10 @@ import (
 
 	"github.com/pavelanni/examiner/internal/i18n"
 	"github.com/pavelanni/examiner/internal/model"
-	"github.com/pavelanni/examiner/internal/store"
 )
 
 func TestAdminUploadDuplicateProtection(t *testing.T) {
-	if err := i18n.Init("en"); err != nil {
-		t.Fatalf("i18n.Init: %v", err)
-	}
-
-	s, err := store.New(":memory:")
-	if err != nil {
-		t.Fatalf("store.New: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
-
+	s := newImportStore(t)
 	h := &Handler{store: s}
 
 	// 1. Подготавливаем JSON с двумя вопросами в одной теме,
@@ -78,8 +68,8 @@ func TestAdminUploadDuplicateProtection(t *testing.T) {
 
 	// Критерий 1: в ответе должно быть локализованное предупреждение о дубликате на английском
 	body1 := rec1.Body.String()
-	if !strings.Contains(body1, "matches question #1 in the file under topic") || !strings.Contains(body1, "Warnings:") {
-		t.Errorf("expected English warning in response, got: %s", body1)
+	if !strings.Contains(body1, "duplicates question 1") {
+		t.Errorf("expected warning in response, got: %s", body1)
 	}
 
 	// Критерий 2: повторный импорт того же файла не меняет количество вопросов и показывает локализованное сообщение
@@ -119,8 +109,8 @@ func TestAdminUploadDuplicateProtection(t *testing.T) {
 	}
 
 	body3 := rec3.Body.String()
-	if !strings.Contains(body3, "matches existing question #") {
-		t.Errorf("expected English warning about existing question in DB, got: %s", body3)
+	if !strings.Contains(body3, "matches existing question") {
+		t.Errorf("expected warning about existing question in DB, got: %s", body3)
 	}
 
 	// Проверяем русскую локаль (RU locale)
@@ -135,7 +125,7 @@ func TestAdminUploadDuplicateProtection(t *testing.T) {
 
 	recRuNew := uploadQuestionsWithLang("questions_ru_test.json", `[{"text": "что такое пид-регулятор", "difficulty": "easy", "topic": "control", "rubric": "r", "model_answer": "a", "max_points": 10}]`, "ru")
 	bodyRuNew := recRuNew.Body.String()
-	if !strings.Contains(bodyRuNew, "совпадает с существующим вопросом #") || !strings.Contains(bodyRuNew, "Предупреждения:") {
+	if !strings.Contains(bodyRuNew, "совпадает с существующим вопросом #") || !strings.Contains(bodyRuNew, "пропущено: 1") {
 		t.Errorf("expected Russian warning about existing question in DB, got: %s", bodyRuNew)
 	}
 
@@ -168,7 +158,7 @@ func TestAdminUploadDuplicateProtection(t *testing.T) {
 	if recCrossTopic.Code != http.StatusOK {
 		t.Fatalf("cross-topic upload status = %d, body: %s", recCrossTopic.Code, recCrossTopic.Body.String())
 	}
-	if !strings.Contains(recCrossTopic.Body.String(), "Successfully imported 1 questions.") {
+	if !strings.Contains(recCrossTopic.Body.String(), "Imported: 1, updated: 0, skipped: 0.") {
 		t.Errorf("expected 1 imported question for new topic, got: %s", recCrossTopic.Body.String())
 	}
 	countAfterCrossTopic, err := s.QuestionCount()

@@ -224,6 +224,23 @@ func (s *Store) migrate() error {
 		return err
 	}
 
+	// Ownership and publication (#44). Existing rows stay published; the
+	// owner is assigned by the startup backfill.
+	for _, col := range []string{
+		`owner_id INTEGER REFERENCES users(id)`,
+		`published INTEGER NOT NULL DEFAULT 1`,
+		`created_at DATETIME`,
+		`updated_at DATETIME`,
+	} {
+		if _, err := s.db.Exec(`ALTER TABLE questions ADD COLUMN ` + col); err != nil && !isAlterDuplicate(err) {
+			return err
+		}
+	}
+	now := time.Now()
+	if _, err := s.db.Exec(`UPDATE questions SET created_at = ?, updated_at = ? WHERE created_at IS NULL`, now, now); err != nil {
+		return err
+	}
+
 	return s.enforceActiveQuestionIdentity()
 }
 
@@ -273,46 +290,6 @@ type sqlExecutor interface {
 	QueryRow(query string, args ...any) *sql.Row
 }
 
-// DeleteUnusedQuestionsByTexts deletes questions whose text is in oldTexts but not in keepTexts
-// and that are not referenced by any question_thread.
-func (s *Store) DeleteUnusedQuestionsByTexts(courseID int, oldTexts, keepTexts []string) error {
-	return deleteUnusedQuestionsByTexts(s.db, courseID, oldTexts, keepTexts)
-}
-
-func deleteUnusedQuestionsByTexts(exec sqlExecutor, courseID int, oldTexts, keepTexts []string) error {
-	if len(oldTexts) == 0 {
-		return nil
-	}
-
-	args := []any{courseID}
-	args = append(args, stringsToAny(oldTexts)...)
-
-	var notInClause string
-	if len(keepTexts) > 0 {
-		notInClause = "AND text NOT IN (" + placeholders(len(keepTexts)) + ")"
-		args = append(args, stringsToAny(keepTexts)...)
-	}
-
-	query := `DELETE FROM questions
-		WHERE course_id = ? AND archived = 0
-		  AND text IN (` + placeholders(len(oldTexts)) + `)
-		  ` + notInClause + `
-		  AND NOT EXISTS (
-		      SELECT 1 FROM question_threads WHERE question_threads.question_id = questions.id
-		  )`
-
-	_, err := exec.Exec(query, args...)
-	return err
-}
-
-func stringsToAny(ss []string) []any {
-	out := make([]any, len(ss))
-	for i, s := range ss {
-		out[i] = s
-	}
-	return out
-}
-
 // InsertQuestion stores a question and returns its ID, or zero for an active duplicate.
 func (s *Store) InsertQuestion(q model.Question) (int64, error) {
 	return insertQuestion(s.db, q)
@@ -323,10 +300,12 @@ func insertQuestion(exec sqlExecutor, q model.Question) (int64, error) {
 		q.TextNorm = model.NormalizeQuestionText(q.Text)
 	}
 	res, err := exec.Exec(
-		`INSERT INTO questions (course_id, text, text_norm, difficulty, topic, rubric, model_answer, max_points)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO questions (course_id, text, text_norm, difficulty, topic, rubric, model_answer, max_points,
+		                        owner_id, published, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(course_id, topic, text_norm) WHERE archived = 0 DO NOTHING`,
 		q.CourseID, q.Text, q.TextNorm, q.Difficulty, q.Topic, q.Rubric, q.ModelAnswer, q.MaxPoints,
+		nullOwner(q.OwnerID), q.Published, time.Now(), time.Now(),
 	)
 	if err != nil {
 		slog.Error("failed to insert question", "error", err)
@@ -350,15 +329,15 @@ func insertQuestion(exec sqlExecutor, q model.Question) (int64, error) {
 
 // ListQuestions returns all questions.
 func (s *Store) ListQuestions() ([]model.Question, error) {
-	rows, err := s.db.Query(`SELECT id, course_id, text, text_norm, difficulty, topic, rubric, model_answer, max_points FROM questions WHERE archived = 0`)
+	rows, err := s.db.Query(`SELECT ` + questionColumns + ` FROM questions WHERE archived = 0`)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 	var questions []model.Question
 	for rows.Next() {
-		var q model.Question
-		if err := rows.Scan(&q.ID, &q.CourseID, &q.Text, &q.TextNorm, &q.Difficulty, &q.Topic, &q.Rubric, &q.ModelAnswer, &q.MaxPoints); err != nil {
+		q, err := scanQuestion(rows)
+		if err != nil {
 			return nil, err
 		}
 		questions = append(questions, q)
@@ -366,7 +345,8 @@ func (s *Store) ListQuestions() ([]model.Question, error) {
 	return questions, rows.Err()
 }
 
-// ListQuestionsFiltered returns questions matching the given filters.
+// ListQuestionsFiltered returns published questions matching the given
+// filters; it feeds students' exams.
 // Empty strings mean no filtering on that field.
 // Difficulty supports comma-separated values (e.g. "easy,medium").
 func (s *Store) ListQuestionsFiltered(difficulty string, topic string) ([]model.Question, error) {
@@ -383,7 +363,7 @@ func (s *Store) ListQuestionsInTopic(difficulty, topic string) ([]model.Question
 
 // listQuestionsFiltered distinguishes an exact topic from the unfiltered bank.
 func (s *Store) listQuestionsFiltered(difficulty string, topic *string) ([]model.Question, error) {
-	query := `SELECT id, course_id, text, text_norm, difficulty, topic, rubric, model_answer, max_points FROM questions WHERE archived = 0`
+	query := `SELECT ` + questionColumns + ` FROM questions WHERE archived = 0 AND published = 1`
 	var args []any
 	if difficulty != "" {
 		var levels []string
@@ -410,8 +390,8 @@ func (s *Store) listQuestionsFiltered(difficulty string, topic *string) ([]model
 	defer func() { _ = rows.Close() }()
 	var questions []model.Question
 	for rows.Next() {
-		var q model.Question
-		if err := rows.Scan(&q.ID, &q.CourseID, &q.Text, &q.TextNorm, &q.Difficulty, &q.Topic, &q.Rubric, &q.ModelAnswer, &q.MaxPoints); err != nil {
+		q, err := scanQuestion(rows)
+		if err != nil {
 			return nil, err
 		}
 		questions = append(questions, q)
@@ -421,11 +401,7 @@ func (s *Store) listQuestionsFiltered(difficulty string, topic *string) ([]model
 
 // GetQuestion returns a question by ID.
 func (s *Store) GetQuestion(id int64) (model.Question, error) {
-	var q model.Question
-	err := s.db.QueryRow(
-		`SELECT id, course_id, text, text_norm, difficulty, topic, rubric, model_answer, max_points FROM questions WHERE id = ?`, id,
-	).Scan(&q.ID, &q.CourseID, &q.Text, &q.TextNorm, &q.Difficulty, &q.Topic, &q.Rubric, &q.ModelAnswer, &q.MaxPoints)
-	return q, err
+	return scanQuestion(s.db.QueryRow(`SELECT `+questionColumns+` FROM questions WHERE id = ?`, id))
 }
 
 // FindQuestionByTopicAndTextNorm returns an existing question with matching course, topic and normalized text.
@@ -434,15 +410,14 @@ func (s *Store) FindQuestionByTopicAndTextNorm(courseID int64, topic, textNorm s
 }
 
 func findQuestionByTopicAndTextNorm(exec sqlExecutor, courseID int64, topic, textNorm string) (*model.Question, error) {
-	var q model.Question
-	err := exec.QueryRow(
-		`SELECT id, course_id, text, text_norm, difficulty, topic, rubric, model_answer, max_points
+	q, err := scanQuestion(exec.QueryRow(
+		`SELECT `+questionColumns+`
 		 FROM questions
 		 WHERE course_id = ? AND topic = ? AND text_norm = ? AND archived = 0
 		 ORDER BY id ASC
 		 LIMIT 1`,
 		courseID, topic, textNorm,
-	).Scan(&q.ID, &q.CourseID, &q.Text, &q.TextNorm, &q.Difficulty, &q.Topic, &q.Rubric, &q.ModelAnswer, &q.MaxPoints)
+	))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -506,9 +481,10 @@ func updateQuestion(exec sqlExecutor, q model.Question) error {
 	}
 	res, err := exec.Exec(
 		`UPDATE questions
-		 SET text = ?, text_norm = ?, difficulty = ?, topic = ?, rubric = ?, model_answer = ?, max_points = ?
+		 SET text = ?, text_norm = ?, difficulty = ?, topic = ?, rubric = ?, model_answer = ?, max_points = ?,
+		     published = ?, updated_at = ?
 		 WHERE id = ? AND archived = 0`,
-		q.Text, q.TextNorm, q.Difficulty, q.Topic, q.Rubric, q.ModelAnswer, q.MaxPoints, q.ID,
+		q.Text, q.TextNorm, q.Difficulty, q.Topic, q.Rubric, q.ModelAnswer, q.MaxPoints, q.Published, time.Now(), q.ID,
 	)
 	if err != nil {
 		return err
@@ -521,118 +497,6 @@ func updateQuestion(exec sqlExecutor, q model.Question) error {
 		return sql.ErrNoRows
 	}
 	return nil
-}
-
-// TeacherQuestionUploadItem represents a deduplicated question candidate in a teacher upload.
-type TeacherQuestionUploadItem struct {
-	QuestionIndex int // 1-based position in the uploaded payload
-	Question      model.Question
-	Owned         bool
-}
-
-// TeacherQuestionSkip describes a question skipped during SaveTeacherQuestions because
-// it matched an existing question not owned by the uploading teacher.
-type TeacherQuestionSkip struct {
-	QuestionIndex int
-	ExistingID    int64
-	Topic         string
-}
-
-// SaveTeacherQuestions atomically saves or updates a teacher's uploaded questions
-// and removes unused questions from oldQuestions within a single transaction.
-func (s *Store) SaveTeacherQuestions(courseID int, items []TeacherQuestionUploadItem, oldQuestions []model.QuestionImport) (savedIndices []int, skips []TeacherQuestionSkip, err error) {
-	return s.saveTeacherQuestions(courseID, items, oldQuestions, "", "", nil)
-}
-
-// SaveTeacherQuestionFile saves the question changes and import hash together.
-// The caller publishes the file before commit and restores it if saving fails.
-// prepare is called only when at least one question is accepted.
-func (s *Store) SaveTeacherQuestionFile(courseID int, items []TeacherQuestionUploadItem, oldQuestions []model.QuestionImport, oldName, name string, prepare func([]int) (string, error)) ([]int, []TeacherQuestionSkip, error) {
-	return s.saveTeacherQuestions(courseID, items, oldQuestions, oldName, name, prepare)
-}
-
-func (s *Store) saveTeacherQuestions(courseID int, items []TeacherQuestionUploadItem, oldQuestions []model.QuestionImport, oldName, name string, prepare func([]int) (string, error)) (savedIndices []int, skips []TeacherQuestionSkip, err error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	type questionKey struct{ topic, normalized string }
-	keep := make(map[questionKey]struct{}, len(items))
-	for _, it := range items {
-		q := it.Question
-		if q.TextNorm == "" {
-			q.TextNorm = model.NormalizeQuestionText(q.Text)
-		}
-
-		existing, err := findQuestionByTopicAndTextNorm(tx, q.CourseID, q.Topic, q.TextNorm)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		if existing != nil {
-			if !it.Owned {
-				skips = append(skips, TeacherQuestionSkip{
-					QuestionIndex: it.QuestionIndex,
-					ExistingID:    existing.ID,
-					Topic:         q.Topic,
-				})
-				continue
-			}
-			q.ID = existing.ID
-			if err := updateQuestion(tx, q); err != nil {
-				return nil, nil, err
-			}
-		} else {
-			if _, err := insertQuestion(tx, q); err != nil {
-				return nil, nil, err
-			}
-		}
-
-		savedIndices = append(savedIndices, it.QuestionIndex)
-		keep[questionKey{q.Topic, q.TextNorm}] = struct{}{}
-	}
-
-	// A file upload with no accepted questions keeps the previous file and rows.
-	if prepare != nil && len(savedIndices) == 0 {
-		return savedIndices, skips, nil
-	}
-	for _, q := range oldQuestions {
-		norm := model.NormalizeQuestionText(q.Text)
-		if _, kept := keep[questionKey{q.Topic, norm}]; kept {
-			continue
-		}
-		// Match the old file entry as well as its identity. A canonical
-		// question from a different file may have different original text.
-		if _, err := tx.Exec(`DELETE FROM questions
-			WHERE course_id = ? AND topic = ? AND text_norm = ? AND text = ? AND archived = 0
-			AND NOT EXISTS (SELECT 1 FROM question_threads WHERE question_id = questions.id)`,
-			courseID, q.Topic, norm, q.Text); err != nil {
-			return nil, nil, err
-		}
-	}
-
-	if prepare != nil {
-		hash, err := prepare(savedIndices)
-		if err != nil {
-			return nil, nil, err
-		}
-		if oldName != "" && oldName != name {
-			if _, err := tx.Exec(`DELETE FROM imported_files WHERE path = ?`, oldName); err != nil {
-				return nil, nil, fmt.Errorf("remove old import hash: %w", err)
-			}
-		}
-		if _, err := tx.Exec(`INSERT INTO imported_files (path, hash, imported_at) VALUES (?, ?, ?)
-			ON CONFLICT(path) DO UPDATE SET hash = excluded.hash, imported_at = excluded.imported_at`,
-			name, hash, time.Now()); err != nil {
-			return nil, nil, fmt.Errorf("save import hash: %w", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, nil, err
-	}
-	return savedIndices, skips, nil
 }
 
 // CreateBlueprint creates an exam blueprint.
@@ -682,6 +546,8 @@ func (s *Store) GetBlueprint(id int64) (model.ExamBlueprint, error) {
 }
 
 // CreateSession creates an exam session with threads for each question.
+// It fails if a question is missing or no longer published, so a question
+// unpublished after the exam was drawn never reaches a student.
 func (s *Store) CreateSession(blueprintID int64, studentID int64, questionIDs []int64) (int64, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1034,9 +900,10 @@ func (s *Store) SetImportedFileHash(path, hash string) error {
 	return nil
 }
 
-// ListDistinctTopics returns all unique topic values from the questions table.
-func (s *Store) ListDistinctTopics() ([]string, error) {
-	rows, err := s.db.Query(`SELECT DISTINCT topic FROM questions WHERE archived = 0 ORDER BY topic`)
+// ListPublishedTopics returns the topics that have at least one active,
+// published question, sorted. Students choose their exam topic from this list.
+func (s *Store) ListPublishedTopics() ([]string, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT topic FROM questions WHERE archived = 0 AND published = 1 ORDER BY topic`)
 	if err != nil {
 		return nil, err
 	}
@@ -1051,6 +918,9 @@ func (s *Store) ListDistinctTopics() ([]string, error) {
 	}
 	return topics, rows.Err()
 }
+
+// sqlChunkSize caps the keys bound in one statement that takes a list.
+const sqlChunkSize = 500
 
 // placeholders returns a comma-separated string of n SQL placeholder marks.
 func placeholders(n int) string {
