@@ -187,5 +187,16 @@
   {"id": "AttemptResetReasonTooLong", "other": "The reason must be no more than 1000 characters."},
   {"id": "AttemptResetInvalidForm", "other": "Invalid reset form."},
   {"id": "AttemptResetConflict", "other": "This attempt has been reset. Return to the home page to start a new attempt."},
-  {"id": "AttemptResetCancel", "other": "Cancel"}
+  {"id": "AttemptResetCancel", "other": "Cancel"},
+  {"id": "GroupName", "other": "Group"},
+  {"id": "ExportStatement", "other": "Export statement"},
+  {"id": "StatementAllTopics", "other": "All topics"},
+  {"id": "StatementAllStatuses", "other": "All submitted attempts"},
+  {"id": "StatementSubmitted", "other": "Submitted"},
+  {"id": "StatementGrading", "other": "Grading"},
+  {"id": "StatementGraded", "other": "Awaiting review"},
+  {"id": "StatementReviewed", "other": "Reviewed"},
+  {"id": "StatementFrom", "other": "Exam start date from"},
+  {"id": "StatementTo", "other": "Exam start date through"},
+  {"id": "StatementTimezone", "other": "Time zone"}
 ]

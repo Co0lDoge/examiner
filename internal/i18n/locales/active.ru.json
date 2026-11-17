@@ -187,5 +187,16 @@
   {"id": "AttemptResetReasonTooLong", "other": "Причина должна содержать не более 1000 символов."},
   {"id": "AttemptResetInvalidForm", "other": "Некорректная форма сброса."},
   {"id": "AttemptResetConflict", "other": "Эта попытка аннулирована. Вернитесь на главную страницу, чтобы начать новую попытку."},
-  {"id": "AttemptResetCancel", "other": "Отмена"}
+  {"id": "AttemptResetCancel", "other": "Отмена"},
+  {"id": "GroupName", "other": "Группа"},
+  {"id": "ExportStatement", "other": "Выгрузить ведомость"},
+  {"id": "StatementAllTopics", "other": "Все темы"},
+  {"id": "StatementAllStatuses", "other": "Все сданные попытки"},
+  {"id": "StatementSubmitted", "other": "Сдано"},
+  {"id": "StatementGrading", "other": "Оценивается"},
+  {"id": "StatementGraded", "other": "Ожидает проверки"},
+  {"id": "StatementReviewed", "other": "Проверено"},
+  {"id": "StatementFrom", "other": "Начало экзамена с"},
+  {"id": "StatementTo", "other": "Начало экзамена по"},
+  {"id": "StatementTimezone", "other": "Часовой пояс"}
 ]
