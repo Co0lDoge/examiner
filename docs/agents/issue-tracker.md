@@ -33,14 +33,23 @@ approval was granted. An `Inconclusive` result, skipped diff, review limit,
 or unreadable file is not a pass for that part of the review. Obtain the
 missing review or resolve the uncertainty with evidence before merging.
 
+When CodeRabbit reports that manual review is required, post
+`@coderabbitai full review` in a PR comment and wait for the actual report.
+The repository configuration enables approval after a completed review,
+excludes skipped reviews, and prevents authors from forcing their own approval.
+
 Distinguish a formal GitHub `APPROVED` review from a successful check or a
 chat reply. When the user or repository rules require approval, verify the
 actual review state. Otherwise report the review state accurately; do not
 describe `COMMENTED` or a chat reply as an approval.
 
 After further code or base changes, check which tests and review conclusions
-became outdated and update them. Merge the verified head using
-`gh pr merge --match-head-commit <sha>` and normal repository rules.
+became outdated and update them. Squash merges are enabled in this repository.
+Specify the verified PR number, repository and head explicitly with a
+non-interactive strategy:
+`gh pr merge <number> --repo pavelanni/examiner --squash --match-head-commit <sha>`.
+Recheck permitted strategies if the repository rules change, and follow the
+normal repository requirements.
 
 ## Pull requests as a triage surface
 
