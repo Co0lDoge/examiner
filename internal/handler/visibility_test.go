@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -38,11 +39,12 @@ func TestLiveScoreOnlyInLiveMode(t *testing.T) {
 			env := newAnswerEnv(t, 3, &fakeLLM{})
 			env.h.config.ScoreVisibility = tt.vis
 
-			rec := env.post("my answer")
-			if rec.Code != http.StatusOK {
+			rec := env.post(t, "my answer")
+			if rec.Code != http.StatusAccepted {
 				t.Fatalf("status %d, body %q", rec.Code, rec.Body.String())
 			}
-			reply := rec.Body.String()
+			runNextEvaluation(t, env.h)
+			reply := env.get(t, env.answerPath())
 			page := env.get(t, fmt.Sprintf("/exam/%d", env.sessID)) // after a reload
 
 			for name, body := range map[string]string{"answer reply": reply, "exam page": page} {
@@ -133,6 +135,20 @@ func TestResultsVisibility(t *testing.T) {
 		}
 	})
 
+	t.Run("annulled/none shows reset notice without promising a review", func(t *testing.T) {
+		env := newRBACEnv(t)
+		env.h.config.ScoreVisibility = model.ScoreNone
+		reset := env.do("teacher", http.MethodPost, fmt.Sprintf("/review/%d/reset", env.sessGraded), url.Values{"confirm": {"yes"}})
+		if reset.Code != http.StatusSeeOther {
+			t.Fatalf("reset: %d, %s", reset.Code, reset.Body.String())
+		}
+		rec := env.do("studentA", http.MethodGet, fmt.Sprintf("/results/%d", env.sessGraded), nil)
+		body := rec.Body.String()
+		if rec.Code != http.StatusOK || !strings.Contains(body, "Attempt reset") || strings.Contains(body, awaitingMark) {
+			t.Fatal("results for an annulled attempt must show its reset status without an awaiting-review notice")
+		}
+	})
+
 	t.Run("reviewed/none shows teacher result only", func(t *testing.T) {
 		env := gradedEnv(t, model.ScoreNone)
 		review(t, env)
@@ -181,7 +197,8 @@ func TestResultsVisibility(t *testing.T) {
 func TestLiveScoreLabelDropsAfterReview(t *testing.T) {
 	env := newAnswerEnv(t, 3, &fakeLLM{})
 	env.h.config.ScoreVisibility = model.ScoreLive
-	env.post("my answer")
+	env.post(t, "my answer")
+	runNextEvaluation(t, env.h)
 	page := fmt.Sprintf("/exam/%d", env.sessID)
 
 	if body := env.get(t, page); !strings.Contains(body, liveScore) || !strings.Contains(body, "(preliminary)") {
