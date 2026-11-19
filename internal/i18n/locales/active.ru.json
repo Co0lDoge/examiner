@@ -236,8 +236,6 @@
   {"id": "BackupWithConfig", "other": "конфигурация"},
   {"id": "FilterStatus", "other": "Статус"},
   {"id": "StatusAll", "other": "Все"},
-  {"id": "StatusGraded", "other": "Ожидает проверки"},
-  {"id": "StatusReviewed", "other": "Проверено"},
   {"id": "FilterDateFrom", "other": "Дата с"},
   {"id": "FilterDateTo", "other": "Дата по"},
   {"id": "FilterToday", "other": "Сегодня"},

@@ -236,8 +236,6 @@
   {"id": "BackupWithConfig", "other": "configuration"},
   {"id": "FilterStatus", "other": "Status"},
   {"id": "StatusAll", "other": "All"},
-  {"id": "StatusGraded", "other": "Awaiting review"},
-  {"id": "StatusReviewed", "other": "Reviewed"},
   {"id": "FilterDateFrom", "other": "From date"},
   {"id": "FilterDateTo", "other": "To date"},
   {"id": "FilterToday", "other": "Today"},

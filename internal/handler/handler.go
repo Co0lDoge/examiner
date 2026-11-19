@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"sync"
@@ -237,8 +238,60 @@ func (h *Handler) handleStudentResults(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (h *Handler) reviewTopics() ([]string, error) {
+	published, err := h.store.ListPublishedTopics()
+	if err != nil {
+		return nil, err
+	}
+	historical, err := h.store.ListHistoricalSubmittedTopics()
+	if err != nil {
+		return nil, err
+	}
+	topicSet := make(map[string]struct{}, len(published)+len(historical))
+	for _, topic := range published {
+		if topic != "" {
+			topicSet[topic] = struct{}{}
+		}
+	}
+	for _, topic := range historical {
+		if topic != "" {
+			topicSet[topic] = struct{}{}
+		}
+	}
+	topics := make([]string, 0, len(topicSet))
+	for topic := range topicSet {
+		topics = append(topics, topic)
+	}
+	sort.Strings(topics)
+	return topics, nil
+}
+
 func (h *Handler) handleReviewList(w http.ResponseWriter, r *http.Request) {
-	filter, view := parseReviewFilter(r.URL.Query(), h.reviewLocation(), h.now())
+	topics, err := h.reviewTopics()
+	if err != nil {
+		slog.Error("failed to list statement topics", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	query := r.URL.Query()
+	filter, view := parseReviewFilter(query, h.reviewLocation(), h.now())
+	view.Topics = topics
+	view.Filters = make(url.Values, len(query))
+	for k, vals := range query {
+		view.Filters[k] = append([]string(nil), vals...)
+	}
+	if view.From != "" {
+		view.Filters.Set("from", view.From)
+	} else {
+		view.Filters.Del("from")
+	}
+	if view.To != "" {
+		view.Filters.Set("to", view.To)
+	} else {
+		view.Filters.Del("to")
+	}
+
 	if view.ErrorKey == "" {
 		rows, total, err := h.store.ListSessionsForReview(filter)
 		if err != nil {
@@ -269,6 +322,13 @@ func (h *Handler) handleReviewList(w http.ResponseWriter, r *http.Request) {
 		if view.Page < view.TotalPages {
 			view.NextURL = buildReviewPageURL(view.Status, view.From, view.To, view.Page+1)
 		}
+		other, err := h.store.ListOtherSessionsForReview()
+		if err != nil {
+			slog.Error("failed to list other sessions for review", "error", err)
+			http.Error(w, "failed to list sessions", http.StatusInternalServerError)
+			return
+		}
+		view.Other = other
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

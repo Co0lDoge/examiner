@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -204,5 +205,131 @@ func TestMigrateSessionTimesToUTC(t *testing.T) {
 	}
 	if got := reviewIDs(rows); !equalIDs(got, []int64{id}) {
 		t.Errorf("ids = %v, want [%d]", got, id)
+	}
+}
+
+func addReviewQuestion(t *testing.T, s *Store, topic string) int64 {
+	t.Helper()
+	var qID int64
+	err := s.InQuestionTx(context.Background(), func(tx *QuestionTx) error {
+		var err error
+		qID, err = tx.Insert(model.Question{
+			CourseID: 1, Text: "Q-" + topic, Difficulty: model.DifficultyEasy, Topic: topic,
+			Rubric: "R", ModelAnswer: "A", MaxPoints: 10, Published: true,
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Insert question: %v", err)
+	}
+	return qID
+}
+
+func TestListSessionsForReviewGradingFailedTopicsAndOther(t *testing.T) {
+	s := newTestStore(t)
+	bpID, err := s.CreateBlueprint(model.ExamBlueprint{CourseID: 1, Name: "Physics"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	qID := addReviewQuestion(t, s, "Optics")
+	now := time.Now().UTC()
+
+	// 1. Known topic, grading_failed (included by default, grades suppressed even if stale rows exist).
+	failedSess, _, err := s.StartSession(bpID, 1, "Optics", []int64{qID}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertGrade(model.Grade{SessionID: failedSess.ID, LLMGrade: 55}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetSessionTimestampsForTest(failedSess.ID, model.StatusGradingFailed, now.Add(-10*time.Minute), &now); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Known empty topic, graded with stale final_grade suppressed.
+	emptyTopicSess, _, err := s.StartSession(bpID, 2, "", []int64{qID}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertGrade(model.Grade{SessionID: emptyTopicSess.ID, LLMGrade: 70}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinalizeGrade(emptyTopicSess.ID, 85, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetSessionTimestampsForTest(emptyTopicSess.ID, model.StatusGraded, now.Add(-20*time.Minute), &now); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Legacy unknown topic (topic_known = 0), reviewed.
+	legacyID := addReviewSession(t, s, model.StatusReviewed, now.Add(-30*time.Minute))
+
+	// 4. Non-reviewable sessions (in_progress and annulled) go to ListOtherSessionsForReview.
+	inProgressID := addReviewSession(t, s, model.StatusInProgress, now.Add(-5*time.Minute))
+	annulledID := addReviewSession(t, s, model.StatusAnnulled, now.Add(-1*time.Minute))
+
+	rows, total, err := s.ListSessionsForReview(ReviewFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 || !equalIDs(reviewIDs(rows), []int64{failedSess.ID, emptyTopicSess.ID, legacyID}) {
+		t.Fatalf("default rows=%v total=%d", reviewIDs(rows), total)
+	}
+	if rows[0].Topic != "Optics" || !rows[0].TopicKnown || rows[0].LLMGrade != nil || rows[0].FinalGrade != nil {
+		t.Errorf("failed row = %+v, want Optics, TopicKnown=true, nil grades", rows[0])
+	}
+	if rows[1].Topic != "" || !rows[1].TopicKnown || rows[1].LLMGrade == nil || *rows[1].LLMGrade != 70 || rows[1].FinalGrade != nil {
+		t.Errorf("graded row = %+v, want empty known topic, LLM=70, Final=nil", rows[1])
+	}
+	if rows[2].TopicKnown {
+		t.Errorf("legacy row TopicKnown = true, want false")
+	}
+
+	failedOnly, failedTotal, err := s.ListSessionsForReview(ReviewFilter{Statuses: []model.SessionStatus{model.StatusGradingFailed}})
+	if err != nil || failedTotal != 1 || !equalIDs(reviewIDs(failedOnly), []int64{failedSess.ID}) {
+		t.Fatalf("grading_failed filter: rows=%v total=%d err=%v", reviewIDs(failedOnly), failedTotal, err)
+	}
+
+	other, err := s.ListOtherSessionsForReview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(other) != 2 || other[0].ID != annulledID || other[1].ID != inProgressID {
+		t.Fatalf("other = %+v, want [%d, %d]", other, annulledID, inProgressID)
+	}
+
+	topics, err := s.ListHistoricalSubmittedTopics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(topics) != 1 || topics[0] != "Optics" {
+		t.Fatalf("historical topics = %v, want [Optics]", topics)
+	}
+}
+
+func TestSessionTimestampWritesAreUTC(t *testing.T) {
+	s := newTestStore(t)
+	bpID, err := s.CreateBlueprint(model.ExamBlueprint{CourseID: 1, Name: "Physics"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	qID := addReviewQuestion(t, s, "Optics")
+	sess, _, err := s.StartSession(bpID, 1, "Optics", []int64{qID}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.QueueSubmission(sess.ID); err != nil {
+		t.Fatal(err)
+	}
+	var started, submitted string
+	if err := s.db.QueryRow(`SELECT CAST(started_at AS TEXT), CAST(submitted_at AS TEXT) FROM exam_sessions WHERE id = ?`, sess.ID).
+		Scan(&started, &submitted); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(started, utcTimeSuffix) {
+		t.Errorf("StartSession started_at = %q, want UTC suffix", started)
+	}
+	if !strings.HasSuffix(submitted, utcTimeSuffix) {
+		t.Errorf("QueueSubmission submitted_at = %q, want UTC suffix", submitted)
 	}
 }

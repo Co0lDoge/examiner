@@ -46,7 +46,7 @@ func TestParseReviewFilter(t *testing.T) {
 		}
 	})
 
-	t.Run("status graded and reviewed", func(t *testing.T) {
+	t.Run("status graded, reviewed, and grading_failed", func(t *testing.T) {
 		f, v := parseReviewFilter(url.Values{"status": {"graded"}}, msk, now)
 		if len(f.Statuses) != 1 || f.Statuses[0] != model.StatusGraded || v.Status != "graded" {
 			t.Errorf("got statuses=%v view.Status=%q", f.Statuses, v.Status)
@@ -54,6 +54,11 @@ func TestParseReviewFilter(t *testing.T) {
 
 		f, v = parseReviewFilter(url.Values{"status": {"reviewed"}}, msk, now)
 		if len(f.Statuses) != 1 || f.Statuses[0] != model.StatusReviewed || v.Status != "reviewed" {
+			t.Errorf("got statuses=%v view.Status=%q", f.Statuses, v.Status)
+		}
+
+		f, v = parseReviewFilter(url.Values{"status": {"grading_failed"}}, msk, now)
+		if len(f.Statuses) != 1 || f.Statuses[0] != model.StatusGradingFailed || v.Status != "grading_failed" {
 			t.Errorf("got statuses=%v view.Status=%q", f.Statuses, v.Status)
 		}
 	})
@@ -398,5 +403,86 @@ func TestHandleReviewListPagination(t *testing.T) {
 	}
 	if !strings.Contains(recRu.Body.String(), `aria-label="Страницы"`) {
 		t.Errorf("expected translated pagination aria-label in Russian, got:\n%s", recRu.Body.String())
+	}
+}
+
+func TestHandleReviewListTopicsGradingFailedAndOther(t *testing.T) {
+	env := newReviewTestEnv(t, "en", "")
+	msk := mustLocation(t, "Europe/Moscow")
+
+	var qID int64
+	if err := env.store.InQuestionTx(t.Context(), func(tx *store.QuestionTx) error {
+		var err error
+		qID, err = tx.Insert(model.Question{
+			CourseID: 1, Text: "Q", Difficulty: model.DifficultyEasy, Topic: "Механика",
+			Rubric: "R", ModelAnswer: "A", MaxPoints: 10, Published: true,
+		})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Known topic, grading_failed (stale LLM grade must not be shown).
+	sFailed, _, err := env.store.StartSession(env.bpID, 1, "Механика", []int64{qID}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.UpsertGrade(model.Grade{SessionID: sFailed.ID, LLMGrade: 61.5}); err != nil {
+		t.Fatal(err)
+	}
+	failedAt := time.Date(2026, 11, 3, 18, 0, 0, 0, msk)
+	if err := env.store.SetSessionTimestampsForTest(sFailed.ID, model.StatusGradingFailed, failedAt, &failedAt); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Known empty topic, graded.
+	sEmpty, _, err := env.store.StartSession(env.bpID, 2, "", []int64{qID}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyAt := time.Date(2026, 11, 3, 17, 0, 0, 0, msk)
+	if err := env.store.SetSessionTimestampsForTest(sEmpty.ID, model.StatusGraded, emptyAt, &emptyAt); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Legacy unknown topic, reviewed.
+	sLegacy := env.addSession(3, model.StatusReviewed, time.Date(2026, 11, 3, 16, 0, 0, 0, msk), 88.0, nil)
+
+	// 4. Non-reviewable session (in_progress) goes to OtherAttempts, not reviewable count.
+	sActive := env.addSession(4, model.StatusInProgress, time.Date(2026, 11, 3, 19, 0, 0, 0, msk), 0, nil)
+
+	rec := env.get("/review")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /review status = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"Механика",
+		"<td>No topic</td>",
+		"<td>—</td>",
+		"Grading failed",
+		"Active and reset attempts",
+		fmt.Sprintf("/review/%d", sActive),
+		fmt.Sprintf("/review/%d/reset", sFailed.ID),
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q in body:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "61.5%") {
+		t.Errorf("stale LLM grade 61.5%% should be suppressed for grading_failed session")
+	}
+
+	// Filter specifically by status=grading_failed.
+	recFailed := env.get("/review?status=grading_failed")
+	if recFailed.Code != http.StatusOK {
+		t.Fatalf("GET /review?status=grading_failed status = %d", recFailed.Code)
+	}
+	bodyFailed := recFailed.Body.String()
+	if !strings.Contains(bodyFailed, fmt.Sprintf("/review/%d\"", sFailed.ID)) {
+		t.Errorf("expected failed session %d in filtered list", sFailed.ID)
+	}
+	if strings.Contains(bodyFailed, fmt.Sprintf("/review/%d\"", sEmpty.ID)) || strings.Contains(bodyFailed, fmt.Sprintf("/review/%d\"", sLegacy)) {
+		t.Errorf("unexpected non-failed session in grading_failed filter")
 	}
 }

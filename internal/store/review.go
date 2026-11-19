@@ -14,7 +14,11 @@ var ErrInvalidDateRange = errors.New("invalid date range: from is after to")
 
 // ReviewStatuses are the session statuses shown in the teacher review list
 // when the filter does not name any.
-var ReviewStatuses = []model.SessionStatus{model.StatusGraded, model.StatusReviewed}
+var ReviewStatuses = []model.SessionStatus{
+	model.StatusGraded,
+	model.StatusReviewed,
+	model.StatusGradingFailed,
+}
 
 // ReviewFilter selects sessions for the teacher review list.
 type ReviewFilter struct {
@@ -39,9 +43,14 @@ type ReviewRow struct {
 // SetSessionTimestampsForTest sets status, started_at, and submitted_at on an
 // existing session for deterministic tests.
 func (s *Store) SetSessionTimestampsForTest(id int64, status model.SessionStatus, startedAt time.Time, submittedAt *time.Time) error {
+	var subUTC *time.Time
+	if submittedAt != nil {
+		t := submittedAt.UTC()
+		subUTC = &t
+	}
 	_, err := s.db.Exec(
 		`UPDATE exam_sessions SET status = ?, started_at = ?, submitted_at = ? WHERE id = ?`,
-		status, startedAt.UTC(), submittedAt, id,
+		status, startedAt.UTC(), subUTC, id,
 	)
 	return err
 }
@@ -79,8 +88,10 @@ func (s *Store) ListSessionsForReview(f ReviewFilter) ([]ReviewRow, int, error) 
 		return nil, 0, fmt.Errorf("count review sessions: %w", err)
 	}
 
-	query := `SELECT s.id, s.blueprint_id, s.student_id, s.status, s.started_at, s.submitted_at,
-		g.llm_grade, g.final_grade
+	query := `SELECT s.id, s.blueprint_id, s.student_id, s.topic, s.topic_known,
+		s.status, s.started_at, s.submitted_at,
+		CASE WHEN s.status IN ('graded', 'reviewed') THEN g.llm_grade END,
+		CASE WHEN s.status = 'reviewed' THEN g.final_grade END
 		FROM exam_sessions s LEFT JOIN grades g ON g.session_id = s.id` +
 		where + ` ORDER BY s.started_at DESC, s.id DESC`
 	if f.Limit > 0 {
@@ -96,8 +107,8 @@ func (s *Store) ListSessionsForReview(f ReviewFilter) ([]ReviewRow, int, error) 
 	var out []ReviewRow
 	for rows.Next() {
 		var r ReviewRow
-		if err := rows.Scan(&r.ID, &r.BlueprintID, &r.StudentID, &r.Status, &r.StartedAt, &r.SubmittedAt,
-			&r.LLMGrade, &r.FinalGrade); err != nil {
+		if err := rows.Scan(&r.ID, &r.BlueprintID, &r.StudentID, &r.Topic, &r.TopicKnown,
+			&r.Status, &r.StartedAt, &r.SubmittedAt, &r.LLMGrade, &r.FinalGrade); err != nil {
 			return nil, 0, err
 		}
 		out = append(out, r)
@@ -105,26 +116,84 @@ func (s *Store) ListSessionsForReview(f ReviewFilter) ([]ReviewRow, int, error) 
 	return out, total, rows.Err()
 }
 
+// ListOtherSessionsForReview returns non-reviewable sessions (in-progress,
+// submitted, grading, or annulled) ordered newest first for the secondary table
+// on the review dashboard.
+func (s *Store) ListOtherSessionsForReview() ([]model.ExamSession, error) {
+	placeholders := "?" + strings.Repeat(", ?", len(ReviewStatuses)-1)
+	args := make([]any, len(ReviewStatuses))
+	for i, st := range ReviewStatuses {
+		args[i] = string(st)
+	}
+	rows, err := s.db.Query(
+		`SELECT `+sessionColumns+` FROM exam_sessions WHERE status NOT IN (`+placeholders+`) ORDER BY started_at DESC, id DESC`,
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list other review sessions: %w", err)
+	}
+	return scanSessions(rows)
+}
+
+// ListHistoricalSubmittedTopics returns distinct non-empty topics from
+// submitted sessions with a known topic, so statement export filters retain
+// historical topics even after their questions are unpublished.
+func (s *Store) ListHistoricalSubmittedTopics() ([]string, error) {
+	rows, err := s.db.Query(
+		`SELECT DISTINCT topic FROM exam_sessions WHERE submitted_at IS NOT NULL AND topic_known = 1 AND topic != '' ORDER BY topic`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list historical submitted topics: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var topics []string
+	for rows.Next() {
+		var topic string
+		if err := rows.Scan(&topic); err != nil {
+			return nil, err
+		}
+		topics = append(topics, topic)
+	}
+	return topics, rows.Err()
+}
+
 // utcTimeSuffix ends every time the driver writes for a UTC time.Time
 // without a monotonic reading (time.Time.String format).
 const utcTimeSuffix = " +0000 UTC"
+
+const utcMigrationBatchSize = 500
 
 // migrateSessionTimesToUTC rewrites started_at and submitted_at values that
 // are not stored in UTC. The driver stores time.Time as text with the
 // writer's offset (and sometimes a monotonic "m=+..." suffix), which SQLite
 // cannot compare across offsets. New values are written in UTC; this
-// converts old ones once. It is a no-op when every value is already UTC.
+// converts old ones once in bounded batches. It is a no-op when every value
+// is already UTC.
 func (s *Store) migrateSessionTimesToUTC() error {
 	for _, col := range []string{"started_at", "submitted_at"} {
+		if err := s.migrateColumnTimesToUTC(col); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) migrateColumnTimesToUTC(col string) error {
+	type fix struct {
+		id int64
+		t  time.Time
+	}
+	var lastID int64
+	for {
 		rows, err := s.db.Query(
-			`SELECT id, ` + col + ` FROM exam_sessions
-			 WHERE ` + col + ` IS NOT NULL AND CAST(` + col + ` AS TEXT) NOT LIKE '%` + utcTimeSuffix + `'`)
+			`SELECT id, `+col+` FROM exam_sessions
+			 WHERE id > ? AND `+col+` IS NOT NULL AND CAST(`+col+` AS TEXT) NOT LIKE '%`+utcTimeSuffix+`'
+			 ORDER BY id LIMIT ?`,
+			lastID, utcMigrationBatchSize,
+		)
 		if err != nil {
 			return fmt.Errorf("find non-UTC %s: %w", col, err)
-		}
-		type fix struct {
-			id int64
-			t  time.Time
 		}
 		var fixes []fix
 		for rows.Next() {
@@ -141,12 +210,17 @@ func (s *Store) migrateSessionTimesToUTC() error {
 		}
 		_ = rows.Close()
 
+		if len(fixes) == 0 {
+			return nil
+		}
 		for _, f := range fixes {
 			if _, err := s.db.Exec(`UPDATE exam_sessions SET `+col+` = ? WHERE id = ?`, f.t.UTC(), f.id); err != nil {
 				return fmt.Errorf("convert %s to UTC: %w", col, err)
 			}
 		}
+		lastID = fixes[len(fixes)-1].id
+		if len(fixes) < utcMigrationBatchSize {
+			return nil
+		}
 	}
-	return nil
 }
-

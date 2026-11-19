@@ -91,6 +91,9 @@ func parseReviewFilter(q url.Values, loc *time.Location, now time.Time) (store.R
 	case string(model.StatusReviewed):
 		view.Status = string(model.StatusReviewed)
 		filter.Statuses = []model.SessionStatus{model.StatusReviewed}
+	case string(model.StatusGradingFailed):
+		view.Status = string(model.StatusGradingFailed)
+		filter.Statuses = []model.SessionStatus{model.StatusGradingFailed}
 	default:
 		view.Status = status
 		view.ErrorKey = "ReviewInvalidStatus"

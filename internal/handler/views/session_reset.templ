@@ -16,6 +16,10 @@ func sessionStatusLabel(ctx context.Context, status model.SessionStatus) string 
 		return t(ctx, "StatementGrading")
 	case model.StatusGradingFailed:
 		return t(ctx, "SessionGradingFailed")
+	case model.StatusGraded:
+		return t(ctx, "StatementGraded")
+	case model.StatusReviewed:
+		return t(ctx, "StatementReviewed")
 	case model.StatusAnnulled:
 		return t(ctx, "AttemptAnnulled")
 	}

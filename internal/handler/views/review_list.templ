@@ -1,8 +1,8 @@
 package views
 
 import (
-	"context"
 	"fmt"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -13,6 +13,9 @@ import (
 // ReviewListView holds the state and results for the teacher review list page.
 type ReviewListView struct {
 	Rows       []store.ReviewRow
+	Other      []model.ExamSession
+	Topics     []string
+	Filters    url.Values
 	Status     string
 	From       string
 	To         string
@@ -32,17 +35,6 @@ func formatReviewTime(ts time.Time, loc *time.Location) string {
 	return ts.In(loc).Format("2006-01-02 15:04")
 }
 
-func reviewStatusLabel(ctx context.Context, st model.SessionStatus) string {
-	switch st {
-	case model.StatusGraded:
-		return t(ctx, "StatusGraded")
-	case model.StatusReviewed:
-		return t(ctx, "StatusReviewed")
-	default:
-		return string(st)
-	}
-}
-
 templ ReviewListPage(view ReviewListView) {
 	@Layout(t(ctx, "ReviewDashboard")) {
 		@Nav([]NavItem{
@@ -56,8 +48,9 @@ templ ReviewListPage(view ReviewListView) {
 					<label for="status">{ t(ctx, "FilterStatus") }</label>
 					<select id="status" name="status">
 						<option value="all" selected?={ view.Status == "" || view.Status == "all" }>{ t(ctx, "StatusAll") }</option>
-						<option value="graded" selected?={ view.Status == "graded" }>{ t(ctx, "StatusGraded") }</option>
-						<option value="reviewed" selected?={ view.Status == "reviewed" }>{ t(ctx, "StatusReviewed") }</option>
+						<option value="graded" selected?={ view.Status == "graded" }>{ t(ctx, "StatementGraded") }</option>
+						<option value="reviewed" selected?={ view.Status == "reviewed" }>{ t(ctx, "StatementReviewed") }</option>
+						<option value="grading_failed" selected?={ view.Status == "grading_failed" }>{ t(ctx, "SessionGradingFailed") }</option>
 					</select>
 				</div>
 				<div>
@@ -83,6 +76,7 @@ templ ReviewListPage(view ReviewListView) {
 				<thead>
 					<tr>
 						<th>{ t(ctx, "ColID") }</th>
+						<th>{ t(ctx, "FilterTopic") }</th>
 						<th>{ t(ctx, "ColStarted") }</th>
 						<th>{ t(ctx, "ColSubmitted") }</th>
 						<th>{ t(ctx, "ColStatus") }</th>
@@ -95,6 +89,13 @@ templ ReviewListPage(view ReviewListView) {
 					for _, s := range view.Rows {
 						<tr>
 							<td>{ fmt.Sprint(s.ID) }</td>
+							<td>
+								if s.TopicKnown {
+									{ topicLabel(ctx, s.Topic) }
+								} else {
+									—
+								}
+							</td>
 							<td>{ formatReviewTime(s.StartedAt, view.Location) }</td>
 							<td>
 								if s.SubmittedAt != nil {
@@ -103,7 +104,7 @@ templ ReviewListPage(view ReviewListView) {
 									-
 								}
 							</td>
-							<td>{ reviewStatusLabel(ctx, s.Status) }</td>
+							<td>{ sessionStatusLabel(ctx, s.Status) }</td>
 							<td>
 								if s.LLMGrade != nil {
 									{ fmt.Sprintf("%.1f%%", *s.LLMGrade) }
@@ -118,7 +119,13 @@ templ ReviewListPage(view ReviewListView) {
 									-
 								}
 							</td>
-							<td><a href={ templ.SafeURL(p(ctx, fmt.Sprintf("/review/%d", s.ID))) }>{ t(ctx, "Review") }</a></td>
+							<td>
+								<a href={ templ.SafeURL(p(ctx, fmt.Sprintf("/review/%d", s.ID))) }>{ t(ctx, "Review") }</a>
+								if s.Status != model.StatusAnnulled {
+									<br/>
+									@resetAttemptLink(s.ExamSession)
+								}
+							</td>
 						</tr>
 					}
 				</tbody>
@@ -155,5 +162,105 @@ templ ReviewListPage(view ReviewListView) {
 		} else if view.ErrorKey == "" {
 			<p>{ t(ctx, "NoExamsToReview") }</p>
 		}
+		if len(view.Other) > 0 {
+			<h2>{ t(ctx, "OtherAttempts") }</h2>
+			<table>
+				<thead>
+					<tr>
+						<th>{ t(ctx, "ColID") }</th>
+						<th>{ t(ctx, "Student") }</th>
+						<th>{ t(ctx, "FilterTopic") }</th>
+						<th>{ t(ctx, "ColStatus") }</th>
+						<th>{ t(ctx, "ColSubmitted") }</th>
+						<th>{ t(ctx, "ColAction") }</th>
+					</tr>
+				</thead>
+				<tbody>
+					for _, s := range view.Other {
+						<tr>
+							<td>{ fmt.Sprint(s.ID) }</td>
+							<td>{ fmt.Sprint(s.StudentID) }</td>
+							<td>
+								if s.TopicKnown {
+									{ topicLabel(ctx, s.Topic) }
+								} else {
+									—
+								}
+							</td>
+							<td>{ sessionStatusLabel(ctx, s.Status) }</td>
+							<td>
+								if s.SubmittedAt != nil {
+									{ formatReviewTime(*s.SubmittedAt, view.Location) }
+								} else {
+									-
+								}
+							</td>
+							<td>
+								<a href={ templ.SafeURL(p(ctx, fmt.Sprintf("/review/%d", s.ID))) }>{ t(ctx, "Review") }</a>
+								if s.Status != model.StatusAnnulled {
+									<br/>
+									@resetAttemptLink(s)
+								}
+							</td>
+						</tr>
+					}
+				</tbody>
+			</table>
+		}
+		<section>
+			<h2>{ t(ctx, "ExportStatement") }</h2>
+			<form method="GET" action={ templ.SafeURL(p(ctx, "/review/export")) }>
+				<div class="grid">
+					<label>{ t(ctx, "FilterTopic") }
+						<select name="topic">
+							<option value="" selected?={ view.Filters.Get("topic") == "" }>{ t(ctx, "StatementAllTopics") }</option>
+							for _, topic := range view.Topics {
+								<option value={ topic } selected?={ view.Filters.Get("topic") == topic }>{ topic }</option>
+							}
+						</select>
+					</label>
+					<label>{ t(ctx, "ColStatus") }
+						<select name="status">
+							for _, option := range []struct{ value, label string }{
+								{"", t(ctx, "StatementAllStatuses")},
+								{"submitted", t(ctx, "StatementSubmitted")},
+								{"grading", t(ctx, "StatementGrading")},
+								{"grading_failed", t(ctx, "SessionGradingFailed")},
+								{"graded", t(ctx, "StatementGraded")},
+								{"reviewed", t(ctx, "StatementReviewed")},
+							} {
+								<option value={ option.value } selected?={ view.Filters.Get("status") == option.value }>{ option.label }</option>
+							}
+						</select>
+					</label>
+				</div>
+				<div class="grid">
+					<label>{ t(ctx, "StatementFrom") }<input type="date" name="from" value={ statementDateFilter(view.Filters, "from") }/></label>
+					<label>{ t(ctx, "StatementTo") }<input type="date" name="to" value={ statementDateFilter(view.Filters, "to") }/></label>
+					<label>{ t(ctx, "StatementTimezone") }<input name="timezone" value={ statementTimezone(view.Filters, view.Location) }/></label>
+				</div>
+				<button name="format" value="csv">{ t(ctx, "ExportStatement") } CSV</button>
+				<button name="format" value="xlsx">{ t(ctx, "ExportStatement") } XLSX</button>
+			</form>
+		</section>
 	}
+}
+
+// statementDateFilter carries a single review date into both export bounds.
+func statementDateFilter(filters url.Values, field string) string {
+	if date := filters.Get("date"); date != "" {
+		return date
+	}
+	return filters.Get(field)
+}
+
+// statementTimezone provides a consistent default for report dates.
+func statementTimezone(filters url.Values, loc *time.Location) string {
+	if zone := filters.Get("timezone"); zone != "" {
+		return zone
+	}
+	if loc != nil {
+		return loc.String()
+	}
+	return "Europe/Moscow"
 }
