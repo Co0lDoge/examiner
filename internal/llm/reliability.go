@@ -87,7 +87,7 @@ var errInvalidResponse = errors.New("invalid LLM response")
 // acquire ожидает разрешение, не переживая отмену или дедлайн попытки.
 func acquire(ctx context.Context, slots chan struct{}) error {
 	if err := ctx.Err(); err != nil {
-		return queueError(err)
+		return err
 	}
 	select {
 	case slots <- struct{}{}:
@@ -97,17 +97,68 @@ func acquire(ctx context.Context, slots chan struct{}) error {
 	}
 }
 
+// GradeAttempt describes the next provider dispatch in a durable grading run.
+// Reserve persists it while both provider slots are held, just before sending.
+type GradeAttempt struct {
+	Number   int
+	Deadline int64 // Unix milliseconds, zero before the first dispatch
+	Reserve  func(context.Context, time.Time) error
+}
+
+var (
+	ErrGradeBudgetExhausted = errors.New("grading request budget exhausted")
+	ErrGradeNotReserved     = errors.New("grading request was not reserved")
+)
+
+type RetryGrade struct {
+	At, Deadline time.Time
+	Cause        error
+}
+
+func (e *RetryGrade) Error() string { return e.Cause.Error() }
+func (e *RetryGrade) Unwrap() error { return e.Cause }
+
+// FailureCode describes a failure without storing raw responses, URLs or credentials.
+func FailureCode(err error) string {
+	if status := statusCode(err); status != 0 {
+		return fmt.Sprintf("HTTP %d", status)
+	}
+	if errors.Is(err, ErrGradeBudgetExhausted) {
+		return "attempts_exhausted"
+	}
+	return outcome(err)
+}
+
 // complete повторяет только временные ошибки, освобождая слоты на время задержки.
 // Общий бюджет ограничивает также очередь и чрезмерно большой Retry-After.
-func (c *Client) complete(ctx context.Context, request openai.ChatCompletionRequest, op string, sessionID, threadID int64) (*GradeResult, string, error) {
+func (c *Client) complete(ctx context.Context, request openai.ChatCompletionRequest, op string, sessionID, threadID int64, job *GradeAttempt) (*GradeResult, string, error) {
 	budget := c.settings.timeout*time.Duration(c.settings.maxRetries+1) + maxBackoff*time.Duration(c.settings.maxRetries)
-	ctx, cancel := context.WithTimeout(ctx, budget)
+	deadline := time.Now().Add(budget)
+	first := 0
+	var reserve func(context.Context) error
+	if job != nil {
+		if job.Reserve == nil || job.Number < 1 {
+			return nil, "", fmt.Errorf("%w: invalid grading attempt", ErrGradeNotReserved)
+		}
+		first = job.Number - 1
+		if job.Deadline != 0 {
+			deadline = time.UnixMilli(job.Deadline)
+		}
+		reserve = func(ctx context.Context) error { return job.Reserve(ctx, deadline) }
+	}
+	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, "", fmt.Errorf("LLM %s: %w", op, err)
+	}
+	if first > c.settings.maxRetries {
+		return nil, "", ErrGradeBudgetExhausted
+	}
 	var raw string
-	for attempt := 0; ; attempt++ {
+	for attempt := first; ; attempt++ {
 		started := time.Now()
 		attemptCtx, attemptCancel := context.WithTimeout(ctx, c.settings.timeout)
-		result, content, headers, err := c.attempt(attemptCtx, request, op, sessionID, threadID)
+		result, content, headers, err := c.attempt(attemptCtx, request, op, sessionID, threadID, reserve)
 		attemptCancel()
 		raw = content
 		slog.Info("LLM request completed", "op", op, "model", c.model, "session_id", sessionID, "thread_id", threadID,
@@ -115,7 +166,7 @@ func (c *Client) complete(ctx context.Context, request openai.ChatCompletionRequ
 		if err == nil {
 			return result, raw, nil
 		}
-		if errors.Is(err, ErrQueueTimeout) {
+		if errors.Is(err, ErrQueueTimeout) || errors.Is(err, ErrGradeNotReserved) {
 			return nil, raw, fmt.Errorf("LLM %s: %w", op, err)
 		}
 		if ctx.Err() != nil {
@@ -129,6 +180,13 @@ func (c *Client) complete(ctx context.Context, request openai.ChatCompletionRequ
 			delay = after
 		}
 		slog.Info("LLM retry scheduled", "op", op, "session_id", sessionID, "thread_id", threadID, "attempt", attempt+2, "delay", delay)
+		if job != nil {
+			at := time.Now().Add(delay)
+			if !at.Before(deadline) {
+				return nil, raw, fmt.Errorf("LLM %s retry: %w", op, context.DeadlineExceeded)
+			}
+			return nil, raw, &RetryGrade{At: at, Deadline: deadline, Cause: err}
+		}
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -141,7 +199,7 @@ func (c *Client) complete(ctx context.Context, request openai.ChatCompletionRequ
 
 // attempt выполняет один запрос. Фоновая оценка занимает максимум N-1 слотов,
 // оставляя один интерактивным ответам при общем лимите N > 1.
-func (c *Client) attempt(ctx context.Context, request openai.ChatCompletionRequest, op string, sessionID, threadID int64) (*GradeResult, string, http.Header, error) {
+func (c *Client) attempt(ctx context.Context, request openai.ChatCompletionRequest, op string, sessionID, threadID int64, reserve func(context.Context) error) (*GradeResult, string, http.Header, error) {
 	if op == "grade" {
 		if err := acquire(ctx, c.gradingSlots); err != nil {
 			return nil, "", nil, err
@@ -152,6 +210,14 @@ func (c *Client) attempt(ctx context.Context, request openai.ChatCompletionReque
 		return nil, "", nil, err
 	}
 	defer func() { <-c.slots }()
+	if reserve != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, "", nil, err
+		}
+		if err := reserve(ctx); err != nil {
+			return nil, "", nil, fmt.Errorf("%w: %w", ErrGradeNotReserved, err)
+		}
+	}
 	resp, err := c.api.CreateChatCompletion(ctx, request)
 	if err != nil {
 		return nil, "", resp.Header(), err

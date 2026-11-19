@@ -4,6 +4,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/pavelanni/examiner/internal/model"
 )
@@ -105,7 +106,7 @@ func TestQueueRecoversFeedbackAndPartiallyGradedExam(t *testing.T) {
 		t.Fatalf("a reserved feedback slot claimed a final grade: %+v, %v", job, err)
 	}
 	first := claimJob(t, s)
-	if err := s.FinishGrading(first, &model.QuestionScore{LLMScore: 7}); err != nil {
+	if err := s.FinishGrading(first, model.QuestionScore{LLMScore: 7}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.QueueAnswer(answering, threads[0].ID, 0, "saved", false); err != nil {
@@ -126,19 +127,30 @@ func TestQueueRecoversFeedbackAndPartiallyGradedExam(t *testing.T) {
 	if job, err := s.ClaimEvaluation(false); job != nil || err != nil {
 		t.Fatalf("merely opening SQLite released a live claim: %+v, %v", job, err)
 	}
+	if _, err := s.RecoverInterruptedSessions(); err != nil {
+		t.Fatal(err)
+	}
+	if job, err := s.ClaimEvaluation(false); err != nil || job != nil {
+		t.Fatalf("startup stole a fresh claim: %+v, %v", job, err)
+	}
+	if _, err := s.db.Exec(`UPDATE evaluation_jobs SET claimed_at=datetime('now','-1 minute') WHERE claimed_at IS NOT NULL`); err != nil {
+		t.Fatal(err)
+	}
 	if n, err := s.RecoverInterruptedSessions(); err != nil || n != 0 {
 		t.Fatalf("reopened an exam with durable work: %d, %v", n, err)
 	}
+	feedback.Generation++
 	if job := claimJob(t, s); job != feedback {
 		t.Fatalf("first resumed job: %+v, want %+v", job, feedback)
 	}
 	if err := s.FinishFeedback(feedback, &model.Message{ThreadID: feedback.ThreadID, Role: model.RoleLLM, Content: "reply"}); err != nil {
 		t.Fatal(err)
 	}
+	last.Generation++
 	if job := claimJob(t, s); job != last {
 		t.Fatalf("reran a staged score or lost last claim: %+v, want %+v", job, last)
 	}
-	if err := s.FinishGrading(last, &model.QuestionScore{LLMScore: 3}); err != nil {
+	if err := s.FinishGrading(last, model.QuestionScore{LLMScore: 3}); err != nil {
 		t.Fatal(err)
 	}
 	view, err := s.GetSessionView(grading)
@@ -176,7 +188,7 @@ func TestEditedQuestionIsGradedAgainstCurrentCriteria(t *testing.T) {
 				t.Fatal(err)
 			}
 			old := claimJob(t, s)
-			original := &model.QuestionScore{LLMScore: 8} // 8 out of 10
+			original := model.QuestionScore{LLMScore: 8} // 8 out of 10
 			if len(questions) == 2 {
 				if err := s.FinishGrading(old, original); err != nil {
 					t.Fatal(err)
@@ -216,7 +228,7 @@ func TestEditedQuestionIsGradedAgainstCurrentCriteria(t *testing.T) {
 					}
 					score = 4 // 4 out of 5 under the new criteria
 				}
-				if err := s.FinishGrading(job, &model.QuestionScore{LLMScore: score}); err != nil {
+				if err := s.FinishGrading(job, model.QuestionScore{LLMScore: score}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -270,5 +282,90 @@ func TestRubricEditRequeuesOnlyUnfinishedFeedback(t *testing.T) {
 	msgs, err := s.GetMessages(tid)
 	if err != nil || len(msgs) != 2 || msgs[0].Content != "saved answer" || msgs[1].Content != "new reply" {
 		t.Fatalf("conversation after rubric edit: %+v, %v", msgs, err)
+	}
+}
+
+func TestFailedThreadRetryPreservesStagedScoresAndFencesExpiredWorker(t *testing.T) {
+	s := newTestStore(t)
+	bp, qs := sessionEnv(t, s)
+	id, err := s.CreateSession(bp, 1, qs[:2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.QueueSubmission(id); err != nil {
+		t.Fatal(err)
+	}
+	first, stale := claimJob(t, s), claimJob(t, s)
+	if err := s.ReserveGradeAttempt(t.Context(), first, time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishGrading(first, model.QuestionScore{LLMScore: 8}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE evaluation_jobs SET claimed_at=datetime('now','-1 minute') WHERE id=?`, stale.ID); err != nil {
+		t.Fatal(err)
+	}
+	current := claimJob(t, s)
+	if current.ID != stale.ID || current.Generation != stale.Generation+1 || current.Attempts != 0 {
+		t.Fatalf("claimed %+v, want newer claim for %+v", current, stale)
+	}
+	if err := s.ReleaseEvaluation(stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReserveGradeAttempt(t.Context(), stale, time.Now().Add(time.Minute)); err == nil {
+		t.Fatal("superseded claim reserved a provider dispatch")
+	}
+	if live, err := s.RenewEvaluation(stale); err != nil || live {
+		t.Fatalf("stale renewal: %t %v", live, err)
+	}
+	if err := s.FinishGrading(stale, model.QuestionScore{LLMScore: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FailGrading(current, "HTTP 401", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if grade, err := s.GetGrade(id); err != nil || grade != nil {
+		t.Fatalf("partial grade: %+v %v", grade, err)
+	}
+	if job, err := s.ClaimEvaluation(false); err != nil || job != nil {
+		t.Fatalf("retried a terminal error: %+v %v", job, err)
+	}
+	exported, err := s.ExportAllSessions()
+	if err != nil || len(exported) != 1 || exported[0].Status != model.StatusGradingFailed || exported[0].LLMGrade != nil {
+		t.Fatalf("unpublished export: %+v, %v", exported, err)
+	}
+	for _, q := range exported[0].Questions {
+		if q.LLMScore != nil {
+			t.Fatal("export turned an unpublished score into a numeric mark")
+		}
+	}
+	if err := s.RetryGrading(id); err != nil {
+		t.Fatal(err)
+	}
+	retry := claimJob(t, s)
+	if retry.ThreadID != current.ThreadID || retry.ID == current.ID || retry.Attempts != 0 || retry.Generation != 1 {
+		t.Fatalf("wrong retry: %+v", retry)
+	}
+	if err := s.FinishGrading(retry, model.QuestionScore{LLMScore: 6}); err != nil {
+		t.Fatal(err)
+	}
+	progress, err := s.GradingProgress(id)
+	if err != nil || len(progress) != 2 || progress[first.ThreadID] != (model.GradingProgress{State: "graded", Attempts: 1}) {
+		t.Fatalf("lost completed work: %+v, %v", progress, err)
+	}
+	if grade, err := s.GetGrade(id); err != nil || grade == nil || grade.LLMGrade != 70 {
+		t.Fatalf("final grade: %+v %v", grade, err)
+	}
+	q, err := s.GetQuestion(qs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.MaxPoints = 2
+	if err := s.UpdateQuestion(q); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.GradingProgress(id)
+	if err != nil || after[first.ThreadID] != progress[first.ThreadID] {
+		t.Fatalf("requeued a published score: %+v %v", after, err)
 	}
 }
