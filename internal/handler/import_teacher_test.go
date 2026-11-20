@@ -5,6 +5,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -103,7 +104,7 @@ func TestTeacherSaveRerendersInput(t *testing.T) {
 func TestTeacherSaveSuccess(t *testing.T) {
 	h, s := teacherEnv(t)
 	rec := teacherSave(t, h, map[string]string{"questions_json": importQuestions(2, nil), "custom_filename": "mid"})
-	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/teacher/profile" {
+	if loc, _ := url.Parse(rec.Header().Get("Location")); rec.Code != http.StatusSeeOther || loc == nil || loc.Path != "/teacher/profile" {
 		t.Fatalf("status = %d, location = %q", rec.Code, rec.Header().Get("Location"))
 	}
 	if files := questionFiles(t); !slices.Equal(files, []string{"teacher_teacher1_mid.json"}) {
@@ -202,11 +203,15 @@ func TestTeacherSaveRejectsBadFilename(t *testing.T) {
 
 func TestTeacherSavePublishFailureRollsBack(t *testing.T) {
 	h, s := teacherEnv(t)
-	// A directory at the destination makes publishing the file fail.
+	// A directory at the destination makes publishing the file fail. The
+	// set is saved over its own name: a new set may not take an existing
+	// name, so it would be refused before publishing.
 	if err := os.Mkdir(filepath.Join("questions", "teacher_teacher1_mid.json"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rec := teacherSave(t, h, map[string]string{"questions_json": importQuestions(2, nil), "custom_filename": "mid"})
+	rec := teacherSave(t, h, map[string]string{
+		"questions_json": importQuestions(2, nil), "custom_filename": "mid", "editing_file": "teacher_teacher1_mid.json",
+	})
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", rec.Code)
 	}
@@ -223,7 +228,6 @@ func TestTeacherSavePublishFailureRollsBack(t *testing.T) {
 		t.Errorf("questions/ = %v, want only the blocking directory (no staging files)", files)
 	}
 }
-
 
 func TestTeacherEditRerendersCustomFilename(t *testing.T) {
 	h, _ := teacherEnv(t)

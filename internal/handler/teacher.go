@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -43,18 +45,48 @@ func (h *Handler) ownsQuestionFile(user *model.User, name string) (bool, error) 
 
 // checkQuestionFileOwner writes 403 (or 500) and returns false unless user
 // owns the question file name.
-func (h *Handler) checkQuestionFileOwner(w http.ResponseWriter, user *model.User, name string) bool {
+func (h *Handler) checkQuestionFileOwner(w http.ResponseWriter, r *http.Request, user *model.User, name string) bool {
 	ok, err := h.ownsQuestionFile(user, name)
 	if err != nil {
 		slog.Error("failed to check question file owner", "file", name, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpError(w, r, http.StatusInternalServerError, "ErrInternal")
 		return false
 	}
 	if !ok {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		httpError(w, r, http.StatusForbidden, "ErrForbidden")
 		return false
 	}
 	return true
+}
+
+// saveSummaryCookie carries the result of a save to the profile, which
+// shows it once and clears it.
+const saveSummaryCookie = "examiner_saved"
+
+// saveSummary reads the result of a save from the cookie value, or nil
+// when it is absent or malformed.
+func saveSummary(q url.Values) *views.SaveSummary {
+	name := q.Get("saved")
+	if name == "" {
+		return nil
+	}
+	sum := views.SaveSummary{Name: name}
+	for key, dst := range map[string]*int{"inserted": &sum.Inserted, "updated": &sum.Updated, "skipped": &sum.Skipped} {
+		n, err := strconv.Atoi(q.Get(key))
+		if err != nil || n < 0 {
+			return nil
+		}
+		*dst = n
+	}
+	return &sum
+}
+
+// setName is the name of a question set as the teacher sees it: the file
+// name without ".json" and without the teacher_<username>_ prefix the
+// server adds.
+func setName(file, username string) string {
+	name := strings.TrimSuffix(file, ".json")
+	return strings.TrimPrefix(name, "teacher_"+username+"_")
 }
 
 // listOwnedQuestionFiles returns the question files user owns.
@@ -206,8 +238,41 @@ func dupChoices(ctx context.Context, dups []questionimport.Duplicate) []views.Du
 	return out
 }
 
+// commonTopic returns the topic shared by every question that has one, or
+// "" when they differ: the constructor offers it as the default topic.
+func commonTopic(qs []views.BuilderQuestion) string {
+	topic := ""
+	for _, q := range qs {
+		switch {
+		case q.Topic == "":
+		case topic == "":
+			topic = q.Topic
+		case q.Topic != topic:
+			return ""
+		}
+	}
+	return topic
+}
+
 func (h *Handler) renderTeacherCreateTest(w http.ResponseWriter, r *http.Request, status int, b views.TeacherBuilder) {
 	user := model.UserFromContext(r.Context())
+	if b.SetName == "" {
+		switch {
+		case b.CustomName != "":
+			// The name as the teacher sent it: running setName on it again
+			// would strip a legacy name and so rename the set on save.
+			b.SetName = b.CustomName
+		case b.Filename != "":
+			b.SetName = setName(b.Filename, user.Username)
+		}
+	}
+	if b.DefaultTopic == "" {
+		b.DefaultTopic = strings.TrimSpace(r.FormValue("default_topic"))
+	}
+	if b.DefaultTopic == "" {
+		b.DefaultTopic = commonTopic(b.Questions)
+	}
+	b.Example = string(questionExampleJSON(appI18n.Lang(r.Context())))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	component := views.TeacherCreateTestPage(user.DisplayName, model.CSRFTokenFromContext(r.Context()), b)
@@ -219,19 +284,34 @@ func (h *Handler) renderTeacherCreateTest(w http.ResponseWriter, r *http.Request
 func (h *Handler) handleTeacherProfile(w http.ResponseWriter, r *http.Request) {
 	user := model.UserFromContext(r.Context())
 	if user == nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		httpError(w, r, http.StatusUnauthorized, "ErrUnauthorized")
 		return
 	}
 
 	files, err := h.listOwnedQuestionFiles(user)
 	if err != nil {
 		slog.Error("failed to check question file owner", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpError(w, r, http.StatusInternalServerError, "ErrInternal")
 		return
 	}
 
+	sets := make([]views.QuestionSet, 0, len(files))
+	for _, f := range files {
+		sets = append(sets, views.QuestionSet{File: f, Name: setName(f, user.Username)})
+	}
+	// The summary of the last save is shown once: the cookie is cleared.
+	var saved *views.SaveSummary
+	if c, err := r.Cookie(saveSummaryCookie); err == nil {
+		if q, err := url.ParseQuery(c.Value); err == nil {
+			saved = saveSummary(q)
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name: saveSummaryCookie, Path: h.path("/teacher/profile"), MaxAge: -1,
+			HttpOnly: true, Secure: h.config.SecureCookies, SameSite: http.SameSiteLaxMode,
+		})
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := views.TeacherProfilePage(user.DisplayName, files, "").Render(r.Context(), w); err != nil {
+	if err := views.TeacherProfilePage(sets, saved).Render(r.Context(), w); err != nil {
 		slog.Error("render error", "error", err)
 	}
 }
@@ -239,7 +319,7 @@ func (h *Handler) handleTeacherProfile(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleTeacherCreateTest(w http.ResponseWriter, r *http.Request) {
 	user := model.UserFromContext(r.Context())
 	if user == nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		httpError(w, r, http.StatusUnauthorized, "ErrUnauthorized")
 		return
 	}
 
@@ -248,7 +328,7 @@ func (h *Handler) handleTeacherCreateTest(w http.ResponseWriter, r *http.Request
 
 	if filename != "" {
 		baseName := filepath.Base(filename)
-		if !h.checkQuestionFileOwner(w, user, baseName) {
+		if !h.checkQuestionFileOwner(w, r, user, baseName) {
 			return
 		}
 		filePath := filepath.Join("questions", baseName)
@@ -260,7 +340,7 @@ func (h *Handler) handleTeacherCreateTest(w http.ResponseWriter, r *http.Request
 			ids, err := h.questionIDs(user, drafts)
 			if err != nil {
 				slog.Error("failed to find stored questions", "file", filename, "error", err)
-				http.Error(w, "internal error", http.StatusInternalServerError)
+				httpError(w, r, http.StatusInternalServerError, "ErrInternal")
 				return
 			}
 			for i := range drafts {
@@ -282,7 +362,7 @@ func (h *Handler) handleTeacherCreateTest(w http.ResponseWriter, r *http.Request
 		var err error
 		if published, err = h.store.AllPublished(user.ID, keys); err != nil {
 			slog.Error("failed to read publication state", "file", filename, "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			httpError(w, r, http.StatusInternalServerError, "ErrInternal")
 			return
 		}
 	}
@@ -295,7 +375,7 @@ func (h *Handler) handleTeacherCreateTest(w http.ResponseWriter, r *http.Request
 func (h *Handler) handleTeacherMe(w http.ResponseWriter, r *http.Request) {
 	user := model.UserFromContext(r.Context())
 	if user == nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		httpError(w, r, http.StatusUnauthorized, "ErrUnauthorized")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -311,13 +391,13 @@ func (h *Handler) handleTeacherMe(w http.ResponseWriter, r *http.Request) {
 // handleTeacherUpload processes question file uploads and test definitions submitted by teachers.
 func (h *Handler) handleTeacherUpload(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(10 << 20); err != nil {
-		http.Error(w, "file too large", http.StatusBadRequest)
+		httpError(w, r, http.StatusBadRequest, "ErrFileTooLarge")
 		return
 	}
 
 	user := model.UserFromContext(r.Context())
 	if user == nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		httpError(w, r, http.StatusUnauthorized, "ErrUnauthorized")
 		return
 	}
 
@@ -328,7 +408,7 @@ func (h *Handler) handleTeacherUpload(w http.ResponseWriter, r *http.Request) {
 		defer func() { _ = file.Close() }()
 		b, err := io.ReadAll(file)
 		if err != nil {
-			http.Error(w, "failed to read file", http.StatusInternalServerError)
+			httpError(w, r, http.StatusInternalServerError, "ErrFileRead")
 			return
 		}
 		data = b
@@ -336,7 +416,7 @@ func (h *Handler) handleTeacherUpload(w http.ResponseWriter, r *http.Request) {
 	} else {
 		txt := r.FormValue("questions_json")
 		if txt == "" {
-			http.Error(w, "no input provided", http.StatusBadRequest)
+			httpError(w, r, http.StatusBadRequest, "ErrNoInput")
 			return
 		}
 		data = []byte(txt)
@@ -365,7 +445,7 @@ func (h *Handler) handleTeacherUpload(w http.ResponseWriter, r *http.Request) {
 	// may name them to be updated by ID, and those dropped are deleted.
 	var oldIDs []int64
 	if editingFile != "" {
-		if !h.checkQuestionFileOwner(w, user, editingFile) {
+		if !h.checkQuestionFileOwner(w, r, user, editingFile) {
 			return
 		}
 		oldPath = filepath.Join("questions", editingFile)
@@ -374,7 +454,7 @@ func (h *Handler) handleTeacherUpload(w http.ResponseWriter, r *http.Request) {
 			ids, err := h.questionIDs(user, oldDrafts)
 			if err != nil {
 				slog.Error("failed to find stored questions", "file", oldPath, "error", err)
-				http.Error(w, "internal error", http.StatusInternalServerError)
+				httpError(w, r, http.StatusInternalServerError, "ErrInternal")
 				return
 			}
 			for _, id := range ids {
@@ -395,13 +475,19 @@ func (h *Handler) handleTeacherUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var safeName string
-	if customFilename != "" {
-		base := filepath.Base(customFilename)
-		base = strings.TrimSuffix(base, ".json")
-		safeName = fmt.Sprintf("teacher_%s_%s.json", user.Username, base)
-	} else if editingFile != "" {
+	switch {
+	case editingFile != "" && customFilename == setName(editingFile, user.Username):
+		// The name field still shows the edited file's own name: keep the
+		// file, even one named by an older version (a doubled prefix,
+		// .json.json) that the name rules below would not reproduce.
 		safeName = editingFile
-	} else {
+	case customFilename != "":
+		// No filepath.Base here: a slash must be refused below, not cut
+		// "Mechanics 1/2" down to "2".
+		safeName = fmt.Sprintf("teacher_%s_%s.json", user.Username, setName(customFilename, user.Username))
+	case editingFile != "":
+		safeName = editingFile
+	default:
 		safeName = fmt.Sprintf("teacher_%s_%d.json", user.Username, time.Now().Unix())
 	}
 	// Reject a name the file system would refuse before anything is
@@ -414,13 +500,25 @@ func (h *Handler) handleTeacherUpload(w http.ResponseWriter, r *http.Request) {
 	// and ivan_mid, ivan saving "mid_exam" would create ivan_mid's file.
 	if ok, err := h.ownsQuestionFile(user, safeName); err != nil {
 		slog.Error("failed to check question file owner", "file", safeName, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpError(w, r, http.StatusInternalServerError, "ErrInternal")
 		return
 	} else if !ok {
 		render(http.StatusBadRequest, []string{appI18n.T(r.Context(), "QImportErrFileNameTaken")}, nil, "")
 		return
 	}
 	outPath := filepath.Join("questions", safeName)
+	// A new or renamed set must not replace another set of the teacher:
+	// that file would be lost and its questions left without a set.
+	if safeName != editingFile {
+		if _, err := os.Lstat(outPath); err == nil {
+			render(http.StatusBadRequest, []string{appI18n.T(r.Context(), "QImportErrSetExists")}, nil, "")
+			return
+		} else if !os.IsNotExist(err) {
+			slog.Error("failed to check question file", "file", outPath, "error", err)
+			httpError(w, r, http.StatusInternalServerError, "ErrInternal")
+			return
+		}
+	}
 
 	// Decisions about duplicates count only for the questions they were
 	// asked about; an edited test is checked again.
@@ -498,6 +596,18 @@ func (h *Handler) handleTeacherUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("teacher uploaded questions", "user", user.Username, "file", outPath,
 		"inserted", res.Inserted, "updated", res.Updated, "skipped", res.Skipped)
+	summary := url.Values{
+		"saved":    {setName(safeName, user.Username)},
+		"inserted": {strconv.Itoa(res.Inserted)},
+		"updated":  {strconv.Itoa(res.Updated)},
+		"skipped":  {strconv.Itoa(res.Skipped)},
+	}
+	// A cookie, not the URL: a reload or a shared link must not show the
+	// summary again.
+	http.SetCookie(w, &http.Cookie{
+		Name: saveSummaryCookie, Value: summary.Encode(), Path: h.path("/teacher/profile"), MaxAge: 60,
+		HttpOnly: true, Secure: h.config.SecureCookies, SameSite: http.SameSiteLaxMode,
+	})
 	http.Redirect(w, r, h.path("/teacher/profile"), http.StatusSeeOther)
 }
 
@@ -521,22 +631,37 @@ func savedQuestionsFile(data []byte, drafts []questionimport.Draft, saved []int)
 func (h *Handler) handleTeacherDownload(w http.ResponseWriter, r *http.Request) {
 	user := model.UserFromContext(r.Context())
 	if user == nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		httpError(w, r, http.StatusUnauthorized, "ErrUnauthorized")
 		return
 	}
+	// chi matches on the raw path when the request has one (escapes Go
+	// would not produce itself, such as %2C for a comma); the name is then
+	// still encoded. Otherwise it is already decoded and may hold a literal %.
 	name := chi.URLParam(r, "name")
+	if r.URL.RawPath != "" {
+		var err error
+		if name, err = url.PathUnescape(name); err != nil {
+			httpError(w, r, http.StatusBadRequest, "ErrInvalidFilename")
+			return
+		}
+	}
 	if name == "" {
-		http.Error(w, "missing name", http.StatusBadRequest)
+		httpError(w, r, http.StatusBadRequest, "ErrMissingName")
 		return
 	}
 	if filepath.Base(name) != name {
-		http.Error(w, "invalid filename", http.StatusBadRequest)
+		httpError(w, r, http.StatusBadRequest, "ErrInvalidFilename")
 		return
 	}
-	if !h.checkQuestionFileOwner(w, user, name) {
+	if !h.checkQuestionFileOwner(w, r, user, name) {
 		return
 	}
 	path := filepath.Join("questions", name)
+	// Save the set as a file named as the teacher sees it, not open the
+	// JSON in the browser.
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{
+		"filename": setName(name, user.Username) + ".json",
+	}))
 	http.ServeFile(w, r, path)
 }
 
