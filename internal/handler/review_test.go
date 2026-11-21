@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -208,17 +209,18 @@ func newReviewTestEnv(t *testing.T, lang, basePath string) *reviewTestEnv {
 				Active:      true,
 			}
 			ctx := model.ContextWithUser(req.Context(), teacher)
-			ctx = model.ContextWithBasePath(ctx, basePath)
 			ctx = i18n.WithLocalizer(ctx, i18n.NewLocalizer(lang))
 			next.ServeHTTP(w, req.WithContext(ctx))
 		})
 	})
 	if basePath != "" {
 		r.Route(basePath, func(sub chi.Router) {
+			sub.Use(h.BasePathMiddleware)
 			sub.Get("/review", h.handleReviewList)
 			sub.Get("/review/{sessionID}", h.handleReviewPage)
 		})
 	} else {
+		r.Use(h.BasePathMiddleware)
 		r.Get("/review", h.handleReviewList)
 		r.Get("/review/{sessionID}", h.handleReviewPage)
 	}
@@ -375,8 +377,9 @@ func TestHandleReviewListPagination(t *testing.T) {
 	if !strings.Contains(body2, "Page 2 of 2 (55 total)") {
 		t.Errorf("expected pagination summary on page 2")
 	}
-	if strings.Count(body2, `href="/review/`) < 5 {
-		t.Errorf("expected 5 session links on page 2")
+	sessionLinkRe := regexp.MustCompile(`href="/review/\d+"`)
+	if got := len(sessionLinkRe.FindAllStringIndex(body2, -1)); got != 5 {
+		t.Errorf("expected 5 session links on page 2, got %d", got)
 	}
 
 	// Clamping out-of-range page to TotalPages and showing rows:
@@ -388,8 +391,8 @@ func TestHandleReviewListPagination(t *testing.T) {
 	if !strings.Contains(bodyClamped, "Page 2 of 2 (55 total)") {
 		t.Errorf("expected clamped page 2, got:\n%s", bodyClamped)
 	}
-	if strings.Count(bodyClamped, `href="/review/`) < 5 {
-		t.Errorf("expected rows rendered on clamped page")
+	if got := len(sessionLinkRe.FindAllStringIndex(bodyClamped, -1)); got != 5 {
+		t.Errorf("expected 5 session links on clamped page, got %d", got)
 	}
 
 	// Pagination nav label in Russian

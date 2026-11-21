@@ -197,6 +197,12 @@ func TestMigrateSessionTimesToUTC(t *testing.T) {
 	if !sess.StartedAt.Equal(local) {
 		t.Errorf("started_at = %v, want the same instant as %v", sess.StartedAt, local)
 	}
+	if sess.SubmittedAt == nil {
+		t.Fatal("submitted_at is nil after migration")
+	}
+	if !sess.SubmittedAt.Equal(local) {
+		t.Errorf("submitted_at = %v, want the same instant as %v", *sess.SubmittedAt, local)
+	}
 
 	// The converted session lands on Nov 3 in Moscow time.
 	rows, _, err := s.ListSessionsForReview(ReviewFilter{From: day(2020, 11, 3), To: day(2020, 11, 4)})
@@ -205,6 +211,33 @@ func TestMigrateSessionTimesToUTC(t *testing.T) {
 	}
 	if got := reviewIDs(rows); !equalIDs(got, []int64{id}) {
 		t.Errorf("ids = %v, want [%d]", got, id)
+	}
+}
+
+func TestMigrateSessionTimesToUTCMarker(t *testing.T) {
+	s := newTestStore(t)
+
+	ok, err := s.hasMigration("session_times_utc")
+	if err != nil {
+		t.Fatalf("hasMigration: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected session_times_utc migration marker to be recorded")
+	}
+
+	// Insert a non-UTC timestamp after the marker is already recorded; a
+	// subsequent migrate() call must skip the scan rather than converting it.
+	local := time.Date(2020, 11, 3, 23, 30, 0, 0, msk)
+	id := addReviewSession(t, s, model.StatusGraded, local)
+	if err := s.migrate(); err != nil {
+		t.Fatalf("second migrate: %v", err)
+	}
+	var started string
+	if err := s.db.QueryRow(`SELECT CAST(started_at AS TEXT) FROM exam_sessions WHERE id = ?`, id).Scan(&started); err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasSuffix(started, utcTimeSuffix) {
+		t.Errorf("expected second migrate() to skip UTC conversion, got %q", started)
 	}
 }
 

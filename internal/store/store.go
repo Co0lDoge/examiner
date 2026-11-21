@@ -300,8 +300,24 @@ func (s *Store) migrate() error {
 
 	// Teacher review list (#52): session times in UTC, so they compare
 	// correctly as text, and an index for the status and date filters.
-	if err := s.migrateSessionTimesToUTC(); err != nil {
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+		name TEXT PRIMARY KEY,
+		applied_at DATETIME NOT NULL
+	)`); err != nil {
 		return err
+	}
+	const utcMigrationName = "session_times_utc"
+	migrated, err := s.hasMigration(utcMigrationName)
+	if err != nil {
+		return err
+	}
+	if !migrated {
+		if err := s.migrateSessionTimesToUTC(); err != nil {
+			return err
+		}
+		if err := s.recordMigration(utcMigrationName); err != nil {
+			return err
+		}
 	}
 	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_exam_sessions_status_started ON exam_sessions(status, started_at)`)
 	if err != nil {
@@ -314,6 +330,20 @@ func (s *Store) migrate() error {
 // isAlterDuplicate returns true if the error indicates the column already exists.
 func isAlterDuplicate(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "duplicate column")
+}
+
+func (s *Store) hasMigration(name string) (bool, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE name = ?`, name).Scan(&count)
+	return count > 0, err
+}
+
+func (s *Store) recordMigration(name string) error {
+	_, err := s.db.Exec(
+		`INSERT OR IGNORE INTO schema_migrations (name, applied_at) VALUES (?, ?)`,
+		name, time.Now().UTC(),
+	)
+	return err
 }
 
 func (s *Store) populateQuestionTextNorm() error {
