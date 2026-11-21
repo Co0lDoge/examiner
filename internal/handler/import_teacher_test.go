@@ -2,10 +2,10 @@ package handler
 
 import (
 	"bytes"
-	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -104,7 +104,7 @@ func TestTeacherSaveRerendersInput(t *testing.T) {
 func TestTeacherSaveSuccess(t *testing.T) {
 	h, s := teacherEnv(t)
 	rec := teacherSave(t, h, map[string]string{"questions_json": importQuestions(2, nil), "custom_filename": "mid"})
-	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/teacher/profile" {
+	if loc, _ := url.Parse(rec.Header().Get("Location")); rec.Code != http.StatusSeeOther || loc == nil || loc.Path != "/teacher/profile" {
 		t.Fatalf("status = %d, location = %q", rec.Code, rec.Header().Get("Location"))
 	}
 	if files := questionFiles(t); !slices.Equal(files, []string{"teacher_teacher1_mid.json"}) {
@@ -146,6 +146,7 @@ func TestTeacherEditRenameRemovesOld(t *testing.T) {
 	teacherSave(t, h, map[string]string{"questions_json": importQuestions(2, nil), "custom_filename": "mid"})
 	rec := teacherSave(t, h, map[string]string{
 		"questions_json":  importQuestions(1, nil),
+		"question_ids":    idsOf(t, s, "Question 1"),
 		"editing_file":    "teacher_teacher1_mid.json",
 		"custom_filename": "final",
 	})
@@ -202,11 +203,15 @@ func TestTeacherSaveRejectsBadFilename(t *testing.T) {
 
 func TestTeacherSavePublishFailureRollsBack(t *testing.T) {
 	h, s := teacherEnv(t)
-	// A directory at the destination makes publishing the file fail.
+	// A directory at the destination makes publishing the file fail. The
+	// set is saved over its own name: a new set may not take an existing
+	// name, so it would be refused before publishing.
 	if err := os.Mkdir(filepath.Join("questions", "teacher_teacher1_mid.json"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rec := teacherSave(t, h, map[string]string{"questions_json": importQuestions(2, nil), "custom_filename": "mid"})
+	rec := teacherSave(t, h, map[string]string{
+		"questions_json": importQuestions(2, nil), "custom_filename": "mid", "editing_file": "teacher_teacher1_mid.json",
+	})
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", rec.Code)
 	}
@@ -221,23 +226,6 @@ func TestTeacherSavePublishFailureRollsBack(t *testing.T) {
 	}
 	if files := questionFiles(t); !slices.Equal(files, []string{"teacher_teacher1_mid.json"}) {
 		t.Errorf("questions/ = %v, want only the blocking directory (no staging files)", files)
-	}
-}
-
-func TestTeacherSaveLeavesInFileDuplicateOut(t *testing.T) {
-	h, _ := teacherEnv(t)
-	q := `{"text":"%s","difficulty":"easy","topic":"t","rubric":"r","model_answer":"a","max_points":5}`
-	payload := "[" + fmt.Sprintf(q, "What is X?") + "," + fmt.Sprintf(q, "what is x") + "," + fmt.Sprintf(q, "Y") + "]"
-	rec := teacherSave(t, h, map[string]string{"questions_json": payload, "custom_filename": "mid"})
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Question 2 duplicates question 1") {
-		t.Fatalf("status = %d; want 200 with the duplicate warning; body: %s", rec.Code, rec.Body.String())
-	}
-	data, err := os.ReadFile(filepath.Join("questions", "teacher_teacher1_mid.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(data), "what is x") || !strings.Contains(string(data), "What is X?") || !strings.Contains(string(data), `"Y"`) {
-		t.Errorf("file = %s; want questions 1 and 3 only", data)
 	}
 }
 

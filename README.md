@@ -330,39 +330,66 @@ removes the registration routes; existing accounts can still sign in.
 
 Admins can upload question JSON files at **Admin → Question upload**
 (`/admin/questions`). The file format is the same as the `--questions`
-flag (see below). Duplicate files (matching SHA-256 hash) are rejected.
+flag (see below). Questions that already exist in their topic are
+skipped with a warning, or updated if the admin picks **Update them**
+before uploading. A file already imported (same name and SHA-256 hash) is
+rejected when skipping, since nothing would change; with **Update them**
+it is imported again.
+
+The same page lists stored questions that duplicate each other (same
+topic, same text after normalization), for example rows imported before
+the duplicate checks existed. They are not deleted automatically, since
+exam sessions may reference them; the server also logs them at startup
+("duplicate questions in database").
 
 ### Teacher question authoring
 
-Teachers and admins can create and edit question files directly from the
-web UI. Log in as a user with the `teacher` or `admin` role and open
-**Profile** (`/teacher/profile`) to see your existing question files.
+Teachers and admins create and edit **question sets** directly from the
+web UI. A set is a group of your questions, stored as one JSON file. Log
+in as a user with the `teacher` or `admin` role and open **Profile**
+(`/teacher/profile`): it lists your sets with **Edit** and **Download**,
+and after a save it shows how many questions were added, updated and
+skipped.
 
-From the profile page you can:
+**Create a set** opens the question builder (`/teacher/create-test`):
 
-- **Create a new question file** — opens the question builder
-  (`/teacher/create-test`).
-- **Edit an existing file** — opens the builder pre-loaded with that file's
-  questions.
+- **Set name** is what the set is called in your list; students do not
+  see it.
+- **Default topic** is filled into new questions; each question's topic
+  can still be changed. An exam is built from the questions of one topic.
+- **Create by hand** shows one block per question: text, topic,
+  difficulty, points, grading criteria and model answer, each with a
+  short hint. Missing fields are marked on the page.
+- **Upload a file** takes a JSON file instead. The tab describes the
+  format and offers an example to download
+  (`/teacher/questions-example.json`, in the UI language). Editing a set
+  works by hand only.
 
-The builder lets you add questions one at a time, remove questions, and
-optionally upload a JSON file to seed a new file. When you save, the file
-is written to `questions/teacher_<username>_<name>.json` and the questions
-are imported into the database.
+When you save, the set is written to `questions/teacher_<username>_<name>.json`
+and the questions are imported into the database. Saving an edited set
+under the same name keeps its file.
 
-Editing a file updates existing questions by their text instead of
-duplicating them. A question removed from the file is deleted only if no
-exam session uses it; one that a session uses stays in the database.
-Editing a question that a session uses changes it in place, so the new
-rubric and model answer apply to answers graded after the save.
+Editing a file updates each question by its database ID, so rewording a
+question changes it in place and saving a file again without changes
+does not add questions. Questions removed from the file are deleted
+unless an exam session uses them; one that a session uses stays in the
+database. Editing a question that a session uses changes it in place, so
+the new rubric and model answer apply to answers graded after the save.
+
+If a saved question matches an existing one in the same topic (ignoring
+case, spacing, ё/е and trailing punctuation), or another question in the
+same file, nothing is saved yet: the builder lists those questions and
+asks what to do with each. **Skip** leaves the question out of the file;
+**Update** overwrites the existing question and is offered only for a
+question you may edit. Editing a question so that it matches another
+stored question in its topic is rejected; change its text instead.
 
 Every question has an owner: the teacher who saved it, or the admin for
 questions imported by an admin or loaded with `--questions`. A teacher
 can change and remove only their own questions; an admin can change any
-question. If a teacher's file contains a question that already belongs to
-someone else (same topic, same text), the whole save is rejected and the
-page lists those questions. Removing a question from your file never
-deletes another teacher's question.
+question. A question that matches someone else's question can only be
+skipped. Removing a question from your file never deletes another
+teacher's question.
 
 The **Publish** checkbox in the builder decides whether the file's
 questions go into students' exams and are visible to other teachers.
@@ -410,17 +437,18 @@ the page lists every error with the question number and field, for
 example "Question 3, field max_points: must be an integer greater than
 0". At startup, an invalid `--questions` file stops the server with the
 same list. A question that matches an existing one in the same topic
-(ignoring case, spacing and trailing punctuation) is skipped with a
-warning; when a teacher saves their own file, it is updated instead (see
-ownership below). A duplicate within a teacher's file is left out of the
-saved file. The same text in a different topic is a separate question.
+(ignoring case, spacing, ё/е and trailing punctuation) is skipped with a
+warning at startup; the admin import skips it or, on request, updates
+it, and the builder asks first (see above). The same text in a different
+topic is a separate question.
 
 | Route | Purpose |
 | ----- | ------- |
-| `/teacher/profile` | List and manage your question files |
-| `/teacher/create-test` | Build a new question file |
-| `/teacher/create-test?file=...` | Edit an existing question file |
-| `/teacher/tests/file/{name}` | Download a question JSON file |
+| `/teacher/profile` | List your question sets; summary of the last save |
+| `/teacher/create-test` | Build a new question set by hand or from a file |
+| `/teacher/create-test?file=...` | Edit an existing question set |
+| `/teacher/tests/file/{name}` | Download a question set as JSON |
+| `/teacher/questions-example.json` | Download an example question file |
 
 ## Security
 

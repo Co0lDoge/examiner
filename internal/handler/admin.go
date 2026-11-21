@@ -23,7 +23,7 @@ func (h *Handler) handleAdminUsersPage(w http.ResponseWriter, r *http.Request) {
 	users, err := h.store.ListUsers()
 	if err != nil {
 		slog.Error("failed to list users", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpError(w, r, http.StatusInternalServerError, "ErrInternal")
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -41,14 +41,14 @@ func (h *Handler) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	role := r.FormValue("role")
 
 	if username == "" || password == "" {
-		http.Error(w, "username and password required", http.StatusBadRequest)
+		httpError(w, r, http.StatusBadRequest, "ErrUsernamePasswordRequired")
 		return
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		slog.Error("failed to hash password", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpError(w, r, http.StatusInternalServerError, "ErrInternal")
 		return
 	}
 
@@ -66,12 +66,12 @@ func (h *Handler) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		Active:       true,
 	})
 	if errors.Is(err, store.ErrUsernameTaken) {
-		http.Error(w, "username already exists", http.StatusConflict)
+		httpError(w, r, http.StatusConflict, "ErrUsernameExists")
 		return
 	}
 	if err != nil {
 		slog.Error("failed to create user", "error", err)
-		http.Error(w, "failed to create user", http.StatusInternalServerError)
+		httpError(w, r, http.StatusInternalServerError, "ErrCreateUser")
 		return
 	}
 
@@ -92,7 +92,7 @@ func (h *Handler) handleToggleUserActive(w http.ResponseWriter, r *http.Request)
 	}
 
 	if err := h.store.ToggleUserActive(id); err != nil {
-		lookupError(w, err, "failed to toggle user active", "user_id", id)
+		lookupError(w, r, err, "failed to toggle user active", "user_id", id)
 		return
 	}
 
@@ -116,7 +116,7 @@ func (h *Handler) handleAdminQuestionsPage(w http.ResponseWriter, r *http.Reques
 func (h *Handler) renderAdminQuestions(w http.ResponseWriter, r *http.Request, status int, flash string, flashErr bool, errs, warnings []string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
-	if err := views.AdminQuestionsPage(flash, flashErr, errs, warnings, h.loadExistingDuplicates()).Render(r.Context(), w); err != nil {
+	if err := views.AdminQuestionsPage(flash, flashErr, errs, warnings, h.loadExistingDuplicates(), string(questionExampleJSON(appI18n.Lang(r.Context())))).Render(r.Context(), w); err != nil {
 		slog.Error("render error", "error", err)
 	}
 }
@@ -125,20 +125,20 @@ func (h *Handler) renderAdminQuestions(w http.ResponseWriter, r *http.Request, s
 // validated first; a file with any error writes nothing.
 func (h *Handler) handleUploadQuestions(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(10 << 20); err != nil {
-		http.Error(w, "file too large", http.StatusBadRequest)
+		httpError(w, r, http.StatusBadRequest, "ErrFileTooLarge")
 		return
 	}
 
 	file, header, err := r.FormFile("questions_file")
 	if err != nil {
-		http.Error(w, "no file uploaded", http.StatusBadRequest)
+		httpError(w, r, http.StatusBadRequest, "ErrNoFile")
 		return
 	}
 	defer func() { _ = file.Close() }()
 
 	data, err := io.ReadAll(file)
 	if err != nil {
-		http.Error(w, "failed to read file", http.StatusInternalServerError)
+		httpError(w, r, http.StatusInternalServerError, "ErrFileRead")
 		return
 	}
 
@@ -148,10 +148,18 @@ func (h *Handler) handleUploadQuestions(w http.ResponseWriter, r *http.Request) 
 	storedHash, err := h.store.GetImportedFileHash(header.Filename)
 	if err != nil {
 		slog.Error("failed to check import status", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpError(w, r, http.StatusInternalServerError, "ErrInternal")
 		return
 	}
-	if storedHash == hash {
+	// Questions already in their topic are skipped unless the admin asks
+	// to update them.
+	mode := questionimport.ModeSkipExisting
+	if r.FormValue("on_duplicate") == "update" {
+		mode = questionimport.ModeUpdateExisting
+	}
+	// Skipping again would change nothing; an update may, so it runs even
+	// for a file imported before.
+	if storedHash == hash && mode == questionimport.ModeSkipExisting {
 		h.renderAdminQuestions(w, r, http.StatusOK, appI18n.T(r.Context(), "UploadDuplicate"), true, nil, nil)
 		return
 	}
@@ -166,7 +174,7 @@ func (h *Handler) handleUploadQuestions(w http.ResponseWriter, r *http.Request) 
 	err = h.store.InQuestionTx(r.Context(), func(tx *store.QuestionTx) error {
 		var err error
 		res, err = questionimport.Apply(tx, drafts, questionimport.Options{
-			Mode:      questionimport.ModeSkipExisting,
+			Mode:      mode,
 			CourseID:  1,
 			File:      &questionimport.FileRecord{Name: header.Filename, Hash: hash},
 			Actor:     model.UserFromContext(r.Context()),
@@ -176,8 +184,8 @@ func (h *Handler) handleUploadQuestions(w http.ResponseWriter, r *http.Request) 
 	})
 	var conflict *questionimport.ConflictError
 	if errors.As(err, &conflict) {
-		// Not reachable with ModeSkipExisting; kept so a mode change cannot
-		// turn a conflict into a 500.
+		// Not reachable for an admin, who may edit every question; kept so a
+		// change of rules cannot turn a conflict into a 500.
 		h.renderAdminQuestions(w, r, http.StatusBadRequest, "", false, questionimport.Localize(r.Context(), conflict.Errs), nil)
 		return
 	}
@@ -188,7 +196,7 @@ func (h *Handler) handleUploadQuestions(w http.ResponseWriter, r *http.Request) 
 	}
 
 	slog.Info("uploaded questions via admin", "filename", header.Filename,
-		"inserted", res.Inserted, "skipped", res.Skipped)
+		"inserted", res.Inserted, "updated", res.Updated, "skipped", res.Skipped)
 
 	summary := appI18n.Td(r.Context(), "QImportSummary", map[string]any{
 		"Inserted": res.Inserted, "Updated": res.Updated, "Skipped": res.Skipped,

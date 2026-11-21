@@ -41,7 +41,7 @@ func (h *Handler) renderIndex(w http.ResponseWriter, r *http.Request, status int
 	}
 	if err != nil {
 		slog.Error("failed to list sessions", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpError(w, r, http.StatusInternalServerError, "ErrInternal")
 		return
 	}
 	// The user's own sessions decide which topics they can continue or start.
@@ -49,7 +49,7 @@ func (h *Handler) renderIndex(w http.ResponseWriter, r *http.Request, status int
 	if user.Role != model.UserRoleStudent {
 		if mine, err = h.store.ListSessionsByUser(user.ID); err != nil {
 			slog.Error("failed to list own sessions", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			httpError(w, r, http.StatusInternalServerError, "ErrInternal")
 			return
 		}
 	}
@@ -57,7 +57,7 @@ func (h *Handler) renderIndex(w http.ResponseWriter, r *http.Request, status int
 	allTopics, err := h.store.ListPublishedTopics()
 	if err != nil {
 		slog.Error("failed to list topics", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpError(w, r, http.StatusInternalServerError, "ErrInternal")
 		return
 	}
 	// If --topic is set, restrict topics to only that value.
@@ -82,7 +82,7 @@ func (h *Handler) renderIndex(w http.ResponseWriter, r *http.Request, status int
 	pool, err := h.store.ListQuestionsFiltered(h.difficultyFilter(), h.config.Topic)
 	if err != nil {
 		slog.Error("failed to list filtered questions", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpError(w, r, http.StatusInternalServerError, "ErrInternal")
 		return
 	}
 	byTopic := make(map[string][]model.Question)
@@ -184,7 +184,8 @@ func shortageText(ctx context.Context, msgID, topic string, shortages []selectio
 	parts := make([]string, 0, len(shortages))
 	for _, s := range shortages {
 		parts = append(parts, appI18n.Td(ctx, msgID, map[string]any{
-			"Topic": topic, "Difficulty": string(s.Difficulty), "Need": s.Need, "Have": s.Have,
+			"Topic": topic, "Difficulty": string(s.Difficulty), "DifficultyLabel": views.DifficultyLabel(ctx, s.Difficulty),
+			"Need": s.Need, "Have": s.Have,
 		}))
 	}
 	return strings.Join(parts, " ")
@@ -202,7 +203,7 @@ func (h *Handler) handleStartExam(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	user := model.UserFromContext(ctx)
 	if err := r.ParseForm(); err != nil {
-		http.Error(w, "invalid form", http.StatusBadRequest)
+		httpError(w, r, http.StatusBadRequest, "ErrInvalidForm")
 		return
 	}
 	selected := r.Form.Has("topic")
@@ -221,7 +222,7 @@ func (h *Handler) handleStartExam(w http.ResponseWriter, r *http.Request) {
 	existing, err := h.store.FindExamSession(blueprintID, user.ID, topic, retake)
 	if err != nil {
 		slog.Error("failed to find exam session", "user", user.ID, "topic", topic, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpError(w, r, http.StatusInternalServerError, "ErrInternal")
 		return
 	}
 	if existing != nil {
@@ -247,7 +248,7 @@ func (h *Handler) handleStartExam(w http.ResponseWriter, r *http.Request) {
 		return
 	case err != nil:
 		slog.Error("failed to draw questions", "topic", topic, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpError(w, r, http.StatusInternalServerError, "ErrInternal")
 		return
 	}
 
@@ -260,7 +261,7 @@ func (h *Handler) handleStartExam(w http.ResponseWriter, r *http.Request) {
 	sess, created, err := h.store.StartSession(blueprintID, user.ID, topic, questionIDs, retake)
 	if err != nil {
 		slog.Error("failed to create session", "user", user.ID, "topic", topic, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpError(w, r, http.StatusInternalServerError, "ErrInternal")
 		return
 	}
 	if created {
